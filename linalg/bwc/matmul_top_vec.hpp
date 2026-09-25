@@ -154,6 +154,11 @@ static inline void mmt_vec_dev_invalidate(mmt_vec const & v) {
         return;
     bwc_dev_invalidate(v.v);
 }
+static inline void mmt_vec_dev_adopt(mmt_vec const & v) {
+    if (mmt_vec_is_shared(v) && v.pi.wr[v.d].trank)
+        return;
+    bwc_dev_adopt(v.v);
+}
 static inline void mmt_vec_dev_mirror(mmt_vec const & v, mmt_vec const & like) {
     if (mmt_vec_is_shared(v) && v.pi.wr[v.d].trank)
         return;

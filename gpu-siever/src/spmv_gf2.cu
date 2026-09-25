@@ -10,6 +10,7 @@
 #include <functional>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <shared_mutex>
@@ -58,13 +59,28 @@ struct __align__(16) gather_chunk {
     uint32_t row;
 };
 
+/* A band segment of at most REC_COLS entries, with its columns inline;
+ * the top bits of row hold the entry count. */
+#define REC_COLS 7
+#define REC_ROW ((1u << 28) - 1)
+struct __align__(32) gather_rec {
+    uint32_t row;
+    uint32_t col[REC_COLS];
+};
+
 /* The rows of one output block on a device: [r0, r1) of the device
  * rows, the chunk range of each band, and the event after its gather. */
 struct gather_seg {
     int blk;
     unsigned int r0, r1;
     std::vector<std::pair<uint64_t, uint64_t>> c;   /* per band */
+    std::vector<std::pair<uint64_t, uint64_t>> r;   /* per band, records */
     cudaEvent_t ev;
+    /* the combine of the segment buffer: the rows in blocks of seg_rows,
+     * and rs[b * (nblk + 1) + k] is the first record of band b whose
+     * row is at or past block k (device, nbands * (nblk + 1)) */
+    unsigned int nblk;
+    uint32_t * rs;
 };
 
 struct spmv_dev {
@@ -77,6 +93,20 @@ struct spmv_dev {
     gather_chunk * chunks;  /* device, one descriptor per chunk */
     std::vector<uint64_t> chunk0;   /* host, nbands + 1 */
     std::vector<uint32_t> chunk_row;   /* host, the device row of each chunk */
+    /* the band segments of at most REC_COLS entries; rec0[b] is the
+     * first record of band b */
+    gather_rec * recs;      /* device, one record per segment */
+    std::vector<uint64_t> rec0;     /* host, nbands + 1 */
+    std::vector<uint32_t> rec_row;  /* host, the device row of each record */
+    /* with a segment buffer (SPMV_GF2_SEG_ROWS) the records are slim:
+     * record k of band b has the columns rcols[rcol0[b] + rptr[k + b]
+     * .. rcol0[b] + rptr[k + b + 1]) and the row rrow[k], its segment
+     * sum goes to segbuf[k], and the combine adds it into the row */
+    uint32_t * rptr = nullptr;      /* device, nrecs + nbands */
+    uint32_t * rcols = nullptr;     /* device, the columns of the records */
+    uint32_t * rrow = nullptr;      /* device, nrecs */
+    uint64_t * segbuf = nullptr;    /* device, nrecs * words */
+    std::vector<uint64_t> rcol0;    /* host, nbands + 1 */
     /* host copies for SPMV_GF2_CHUNK_ORDER=col: the chunks in row
      * order and the first column of each */
     std::vector<gather_chunk> chunk_h;
@@ -93,6 +123,9 @@ struct spmv_dev {
     std::vector<cudaEvent_t> pe; /* timing events around the probed kernels */
     size_t npe = 0;         /* events recorded in the probed call */
     double busy = 0;        /* kernel time of the probed calls, seconds */
+    cudaEvent_t span[2] = { nullptr, nullptr }; /* a probed call: launch, product end */
+    bool spanned = false;   /* span holds the last probed call */
+    double wait = 0;        /* the probed calls: span less kernel time, seconds */
     int l2cap = 0;          /* max access policy window bytes (SPMV_GF2_L2_MB) */
 };
 
@@ -115,6 +148,10 @@ struct spmv_gf2 {
     row_stream rs;
     std::vector<uint64_t> work;
     unsigned long probe0 = 0, probe1 = 0;
+    /* the split before the last probed split, and the slowest device
+     * time that it measured; empty once a probe has kept the split */
+    std::vector<std::pair<unsigned int, unsigned int>> split_before;
+    double slowest_before = 0;
     unsigned int nbands;
     unsigned int bandcols;  /* source columns per band */
     unsigned int words;     /* 64-bit words per vector element */
@@ -272,6 +309,7 @@ struct arena_ctx {
     uint64_t * qsrc = nullptr;  /* host copy the offset uploads read */
     size_t qwords = 0;
     std::map<int, replica> reps; /* per device, a copy for the combine */
+    bool combined = false;      /* a combine wrote this arena */
     uint64_t * obuf = nullptr;  /* device, combine result and coefficients */
     size_t owords = 0;
     cudaEvent_t ev;             /* the ready event of the arena */
@@ -332,6 +370,16 @@ static bool env_addmul64_nibble()
     return s && !strcmp(s, "nibble");
 }
 
+/* SPMV_GF2_COMBINE_AHEAD=1: the combine computes its terms into a
+ * scratch vector on every device as soon as it is issued, while the
+ * exchange into the destination is still running, and then XORs the
+ * scratch into each copy of the destination */
+static bool env_combine_ahead()
+{
+    const char * s = getenv("SPMV_GF2_COMBINE_AHEAD");
+    return s && atoi(s);
+}
+
 /* The ready field of an arena holds the event that fires when every
  * queued device access to the mirror is complete (see
  * bwc_device_arena.hpp).  This backend stores only the arena's own
@@ -370,6 +418,25 @@ static void mirror_written(bwc_device_arena * a)
     auto * c = (arena_ctx *) a->owner;
     c->pieces.nout = 0;
     c->pieces.wgen++;
+}
+
+/* A read of the mirror range [off, off + bytes) that a product left
+ * unwritten for the plugin (bwc_dev_pieces::out_only) aborts. */
+static void stale_check(bwc_device_arena * a, size_t off, size_t bytes,
+        const char * what)
+{
+    bwc_dev_pieces const & p = ((arena_ctx *) a->owner)->pieces;
+    if (!bwc_dev_stale_hits(&p, off, bytes))
+        return;
+    fprintf(stderr, "spmv_gf2: %s reads the mirror range [%zu, %zu), and"
+            " [%zu, %zu) holds rows the product left to the plugin\n",
+            what, off, off + bytes, p.stale_lo, p.stale_hi);
+    abort();
+}
+
+static void stale_clear(bwc_device_arena * a, size_t off, size_t bytes)
+{
+    bwc_dev_stale_clear(&((arena_ctx *) a->owner)->pieces, off, bytes);
 }
 
 /* publish the accesses queued on the arena stream after a write
@@ -493,10 +560,10 @@ __global__ void dotprod64_kernel(const uint64_t * y, size_t words,
 struct addmul64_srcs { const uint64_t * p[ADDMUL64_MAX]; };
 __global__ void addmul64_kernel(uint64_t * dst, addmul64_srcs s,
                                 const uint64_t * f, unsigned int nsrc,
-                                unsigned int n);
+                                unsigned int n, unsigned int acc);
 __global__ void addmul64_nibble_kernel(uint64_t * dst, addmul64_srcs s,
                                        const uint64_t * f, unsigned int nsrc,
-                                       unsigned int n);
+                                       unsigned int n, unsigned int acc);
 
 static bwc_device_arena * mirror_on(int device, const void * host,
         size_t bytes);
@@ -506,6 +573,7 @@ static void arena_to_host(bwc_device_arena * a, size_t off, size_t bytes)
 {
     auto * c = (arena_ctx *) a->owner;
     std::lock_guard<std::mutex> const lock(c->mtx);
+    stale_check(a, off, bytes, "a copy to the host");
     ready_sync(a);
     CUDA_CHECK(cudaSetDevice(c->device));
     CUDA_CHECK(cudaMemcpy((char *) a->host + off, (char *) a->dev + off,
@@ -518,6 +586,7 @@ static void arena_to_dev(bwc_device_arena * a, size_t off, size_t bytes)
     std::lock_guard<std::mutex> const lock(c->mtx);
     ready_sync(a);
     mirror_written(a);
+    stale_clear(a, off, bytes);
     CUDA_CHECK(cudaSetDevice(c->device));
     CUDA_CHECK(cudaMemcpy((char *) a->dev + off, (char *) a->host + off,
                 bytes, cudaMemcpyHostToDevice));
@@ -566,6 +635,8 @@ static void arena_words_to_host(bwc_device_arena * a,
     /* the threads that share one vector gather concurrently */
     auto * c = (arena_ctx *) a->owner;
     std::lock_guard<std::mutex> const lock(c->mtx);
+    for (size_t i = 0; i < n; i++)
+        stale_check(a, off[i], sizeof(uint64_t), "a word gather");
     ensure_words(c, n);
     ready_wait(a, c->stream);
     gather_words(c, a, off, n, c->dval);
@@ -588,6 +659,8 @@ static void arena_words_queue(bwc_device_arena * a,
         return;
     auto * c = (arena_ctx *) a->owner;
     std::lock_guard<std::mutex> const lock(c->mtx);
+    for (size_t i = 0; i < n; i++)
+        stale_check(a, off[i], sizeof(uint64_t), "a queued word gather");
     CUDA_CHECK(cudaSetDevice(c->device));
     if (c->qwords < (slot + 1) * n) {
         size_t want = 2 * c->qwords;
@@ -666,6 +739,8 @@ static void arena_dev_copy(bwc_device_arena * dst, size_t doff,
     auto * cd = (arena_ctx *) dst->owner;
     auto * cs = (arena_ctx *) src->owner;
     arena_lock2 const lock(cd, cs);
+    stale_check(src, soff, bytes, "a device copy");
+    stale_clear(dst, doff, bytes);
     /* band_publish creates its events in the current device context */
     CUDA_CHECK(cudaSetDevice(cd->device));
     band_begin(dst);
@@ -699,6 +774,8 @@ static void arena_dev_xor(bwc_device_arena * dst, size_t doff,
     auto * cd = (arena_ctx *) dst->owner;
     auto * cs = (arena_ctx *) src->owner;
     arena_lock2 const lock(cd, cs);
+    stale_check(src, soff, bytes, "a device xor");
+    stale_check(dst, doff, bytes, "a device xor");
     CUDA_CHECK(cudaSetDevice(cd->device));
     bool const peer = cs->device != cd->device;
     if (peer && cd->xbytes < bytes) {
@@ -781,11 +858,30 @@ static void arena_release(bwc_device_arena * a)
 struct combine_dev {
     cudaStream_t stream;
     cudaEvent_t ev;
+    cudaEvent_t aev;            /* the terms are in the scratch */
     uint64_t * fbuf;            /* device, the combine matrices */
+    uint64_t * terms = nullptr; /* device, the scratch of the terms */
+    size_t terms_words = 0;
     int nsms;
 };
 static std::mutex combine_mutex;
 static std::map<int, combine_dev> combine_devs;
+
+/* per device, the event after the last product launched on it; the
+ * caller has set the device */
+static std::mutex product_mutex;
+static std::map<int, cudaEvent_t> product_evs;
+
+static cudaEvent_t product_ev(int device)
+{
+    std::lock_guard<std::mutex> const lock(product_mutex);
+    auto const it = product_evs.find(device);
+    if (it != product_evs.end())
+        return it->second;
+    cudaEvent_t & ev = product_evs[device];
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    return ev;
+}
 
 static combine_dev & combine_on(int device)
 {
@@ -797,6 +893,7 @@ static combine_dev & combine_on(int device)
     combine_dev & c = combine_devs[device];
     CUDA_CHECK(cudaStreamCreate(&c.stream));
     CUDA_CHECK(cudaEventCreateWithFlags(&c.ev, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&c.aev, cudaEventDisableTiming));
     CUDA_CHECK(cudaMalloc(&c.fbuf, ADDMUL64_MAX * 64 * sizeof(uint64_t)));
     CUDA_CHECK(cudaDeviceGetAttribute(&c.nsms,
                 cudaDevAttrMultiProcessorCount, device));
@@ -804,23 +901,6 @@ static combine_dev & combine_on(int device)
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 ADDMUL64_MAX * 2048 * sizeof(uint64_t)));
     return c;
-}
-
-/* The devices that combine a slice each: the devices the instances of
- * the process drive that reach the destination device directly, the
- * destination device first. */
-static std::vector<int> combine_devices(int device)
-{
-    std::vector<int> devs { device };
-    std::lock_guard<std::mutex> const lock(pin_mutex);
-    for (int const d : pin_devices) {
-        int can = 0;
-        if (d != device)
-            CUDA_CHECK(cudaDeviceCanAccessPeer(&can, d, device));
-        if (can)
-            devs.push_back(d);
-    }
-    return devs;
 }
 
 /* The mirror of a as device reads it: the mirror itself on its own
@@ -831,6 +911,7 @@ static const uint64_t * replica_on(bwc_device_arena * a, int device,
         cudaStream_t s)
 {
     auto * c = (arena_ctx *) a->owner;
+    stale_check(a, 0, a->bytes, "a combine source");
     if (c->device == device) {
         ready_wait(a, s);
         return (const uint64_t *) a->dev;
@@ -851,18 +932,71 @@ static const uint64_t * replica_on(bwc_device_arena * a, int device,
     return r.p;
 }
 
+/* One copy of a range of an arena: the mirror, or a source replica on
+ * a product device. */
+struct arena_copy {
+    int device;
+    uint64_t * d;
+};
+
+/* The mirror range [off, off + bytes) of the arena, followed by the
+ * same range of each source replica; the replicas cover the range. */
+static std::vector<arena_copy> copies_of(bwc_device_arena * a, size_t off,
+        size_t bytes)
+{
+    auto * c = (arena_ctx *) a->owner;
+    std::vector<arena_copy> copies {
+        { c->device, (uint64_t *) ((char *) a->dev + off) } };
+    bwc_dev_pieces const & p = c->pieces;
+    for (int k = 0; k < p.nrep; k++) {
+        bwc_dev_piece const & r = p.rep[k];
+        if (off < r.off || r.off + r.bytes < off + bytes) {
+            fprintf(stderr, "spmv_gf2: the source replicas [%zu, %zu) do not"
+                    " cover the written range [%zu, %zu)\n", r.off,
+                    r.off + r.bytes, off, off + bytes);
+            abort();
+        }
+        copies.push_back({ r.device, (uint64_t *) (r.p + (off - r.off)) });
+    }
+    return copies;
+}
+
+/* Make the stream wait for the accesses queued to the mirror and to
+ * its source replicas.  The caller holds the arena lock. */
+static void copies_wait(bwc_device_arena * a, cudaStream_t s)
+{
+    bwc_dev_pieces const & p = ((arena_ctx *) a->owner)->pieces;
+    ready_wait(a, s);
+    for (int k = 0; k < p.nrep; k++)
+        CUDA_CHECK(cudaStreamWaitEvent(s, p.rep[k].ready, 0));
+}
+
+/* Publish a write of the range [off, off + bytes) of the mirror and of
+ * every source replica, queued on the arena stream: the replicas stay
+ * current, and the band lets the next product read them. */
+static void copies_written(bwc_device_arena * a, size_t off, size_t bytes)
+{
+    auto * c = (arena_ctx *) a->owner;
+    ready_record(a);
+    c->pieces.rep_wgen = c->pieces.wgen;
+    band_publish(a, off, bytes);
+}
+
 /* This creates a mirror for each source vector that has none, and
  * moves it to the device state.  After that, a host write to a source
  * vector must go through bwc_dev_push or bwc_dev_invalidate, or the
  * write is lost.
  *
- * The destination range splits into one slice per device of the
- * process.  Each device reads its slice of the sources from its own
- * copy of them (the sources of mksol change once per block, so the
- * copies are rare) and reads and writes its slice of the destination
- * in place through peer access.  One kernel per slice reads up to
- * ADDMUL64_MAX sources; more sources take further passes.  The
- * destination stream waits for every slice before it publishes. */
+ * The destination has current source replicas on the product devices
+ * (the exchange or the last write of the mirror filled them), and the
+ * destination range splits into one slice per copy.  Each device reads
+ * its slice of the sources from its own copy of them (the sources of
+ * mksol change once per block, so the copies are rare), combines its
+ * slice in its own copy of the destination and sends it to the other
+ * copies, so the replicas stay current and the next product copies
+ * nothing.  One kernel per slice reads up to ADDMUL64_MAX sources; more
+ * sources take further passes.  The destination stream waits for every
+ * slice before it publishes. */
 static void arena_dev_addmul64(bwc_device_arena * dst, size_t doff,
         size_t bytes, unsigned int nsrc, const void * const * v,
         const void * const * v_base, const size_t * v_bytes,
@@ -878,18 +1012,21 @@ static void arena_dev_addmul64(bwc_device_arena * dst, size_t doff,
     arena_lockn const lock(ctxs);
     for (unsigned int j = 0; j < nsrc; j++)
         arena_make_dev(src[j], 0);
-    std::vector<int> const devs = combine_devices(cd->device);
+    bwc_dev_pieces const & p = cd->pieces;
+    if (!p.nrep || p.rep_wgen != p.wgen) {
+        fprintf(stderr, "spmv_gf2: the combine finds no current source"
+                " replicas (%d replicas, written at generation %lu of %lu)\n",
+                p.nrep, p.rep_wgen, p.wgen);
+        abort();
+    }
+    stale_check(dst, doff, bytes, "the combine");
+    std::vector<arena_copy> const copies = copies_of(dst, doff, bytes);
     size_t const n = bytes / sizeof(uint64_t);
-    size_t const slice = (n + devs.size() - 1) / devs.size();
-    auto * const d = (uint64_t *) ((char *) dst->dev + doff);
-    for (size_t i = 0; i < devs.size(); i++) {
-        size_t const w0 = std::min(n, i * slice);
-        unsigned int const nw = std::min(n, w0 + slice) - w0;
-        if (!nw)
-            break;
-        combine_dev & c = combine_on(devs[i]);
-        CUDA_CHECK(cudaSetDevice(devs[i]));
-        ready_wait(dst, c.stream);
+    size_t const slice = (n + copies.size() - 1) / copies.size();
+    /* the terms of words [w0, w0 + nw) into d, on the combine stream of
+     * the device */
+    auto terms = [&](combine_dev & c, int device, uint64_t * d, size_t w0,
+            unsigned int nw, unsigned int acc) {
         for (unsigned int j0 = 0; j0 < nsrc; j0 += ADDMUL64_MAX) {
             unsigned int const k = std::min(nsrc - j0,
                     (unsigned) ADDMUL64_MAX);
@@ -899,7 +1036,7 @@ static void arena_dev_addmul64(bwc_device_arena * dst, size_t doff,
                 size_t const soff = (const char *) v[j0 + j]
                     - (const char *) a->host;
                 s.p[j] = (const uint64_t *) ((const char *)
-                        replica_on(a, devs[i], c.stream) + soff) + w0;
+                        replica_on(a, device, c.stream) + soff) + w0;
                 CUDA_CHECK(cudaMemcpyAsync(c.fbuf + 64 * j, f[j0 + j],
                             64 * sizeof(uint64_t), cudaMemcpyHostToDevice,
                             c.stream));
@@ -909,17 +1046,93 @@ static void arena_dev_addmul64(bwc_device_arena * dst, size_t doff,
             if (env_addmul64_nibble())
                 addmul64_nibble_kernel<<<blocks, 256,
                     k * 256 * sizeof(uint64_t), c.stream>>>(
-                            d + w0, s, c.fbuf, k, nw);
+                            d, s, c.fbuf, k, nw, acc || j0);
             else
                 addmul64_kernel<<<blocks, 256, k * 2048 * sizeof(uint64_t),
-                    c.stream>>>(d + w0, s, c.fbuf, k, nw);
+                    c.stream>>>(d, s, c.fbuf, k, nw, acc || j0);
             CUDA_CHECK(cudaGetLastError());
+        }
+    };
+    if (env_combine_ahead()) {
+        std::vector<int> devs;
+        for (arena_copy const & cp : copies)
+            if (std::find(devs.begin(), devs.end(), cp.device) == devs.end())
+                devs.push_back(cp.device);
+        for (int device : devs) {
+            combine_dev & c = combine_on(device);
+            if (c.terms_words >= n)
+                continue;
+            CUDA_CHECK(cudaSetDevice(device));
+            CUDA_CHECK(cudaStreamSynchronize(c.stream));
+            if (c.terms)
+                CUDA_CHECK(cudaFree(c.terms));
+            CUDA_CHECK(cudaMalloc(&c.terms, n * sizeof(uint64_t)));
+            c.terms_words = n;
+        }
+        /* each device computes one slice into its scratch and copies it
+         * into the scratch of the other devices, after the folds of the
+         * previous combine have read the scratch */
+        for (size_t i = 0; i < copies.size(); i++) {
+            size_t const w0 = std::min(n, i * slice);
+            unsigned int const nw = std::min(n, w0 + slice) - w0;
+            if (!nw)
+                break;
+            int const device = copies[i].device;
+            combine_dev & c = combine_on(device);
+            CUDA_CHECK(cudaSetDevice(device));
+            for (int other : devs)
+                CUDA_CHECK(cudaStreamWaitEvent(c.stream,
+                            combine_on(other).ev, 0));
+            CUDA_CHECK(cudaStreamWaitEvent(c.stream, product_ev(device), 0));
+            uint64_t * const d = c.terms + w0;
+            terms(c, device, d, w0, nw, 0);
+            for (size_t j = 1; j < devs.size(); j++) {
+                int const other = devs[(std::find(devs.begin(), devs.end(),
+                            device) - devs.begin() + j) % devs.size()];
+                CUDA_CHECK(cudaMemcpyPeerAsync(combine_on(other).terms + w0,
+                            other, d, device, nw * sizeof(uint64_t),
+                            c.stream));
+            }
+            CUDA_CHECK(cudaEventRecord(c.aev, c.stream));
+        }
+        for (arena_copy const & cp : copies) {
+            combine_dev & c = combine_on(cp.device);
+            CUDA_CHECK(cudaSetDevice(cp.device));
+            copies_wait(dst, c.stream);
+            for (int other : devs)
+                CUDA_CHECK(cudaStreamWaitEvent(c.stream,
+                            combine_on(other).aev, 0));
+            xor_kernel<<<(n + 255) / 256, 256, 0, c.stream>>>(cp.d,
+                    c.terms, n);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaEventRecord(c.ev, c.stream));
+            CUDA_CHECK(cudaStreamWaitEvent(cd->stream, c.ev, 0));
+        }
+    }
+    for (size_t i = 0; i < copies.size() && !env_combine_ahead(); i++) {
+        size_t const w0 = std::min(n, i * slice);
+        unsigned int const nw = std::min(n, w0 + slice) - w0;
+        if (!nw)
+            break;
+        int const device = copies[i].device;
+        combine_dev & c = combine_on(device);
+        CUDA_CHECK(cudaSetDevice(device));
+        copies_wait(dst, c.stream);
+        uint64_t * const d = copies[i].d + w0;
+        terms(c, device, d, w0, nw, 1);
+        /* the destinations rotate with the source, so no device
+         * receives from every other device at the same time */
+        for (size_t j = 1; j < copies.size(); j++) {
+            arena_copy const & cp = copies[(i + j) % copies.size()];
+            CUDA_CHECK(cudaMemcpyPeerAsync(cp.d + w0, cp.device, d,
+                        device, nw * sizeof(uint64_t), c.stream));
         }
         CUDA_CHECK(cudaEventRecord(c.ev, c.stream));
         CUDA_CHECK(cudaStreamWaitEvent(cd->stream, c.ev, 0));
     }
     CUDA_CHECK(cudaSetDevice(cd->device));
-    ready_record(dst);
+    copies_written(dst, doff, bytes);
+    cd->combined = true;
     for (unsigned int j = 0; j < nsrc; j++)
         ready_follow(src[j], dst);
 }
@@ -932,6 +1145,7 @@ static void arena_dev_dotprod64(bwc_device_arena * src, size_t soff,
 {
     auto * cs = (arena_ctx *) src->owner;
     std::lock_guard<std::mutex> const lock(cs->mtx);
+    stale_check(src, soff, bytes, "a dot product");
     CUDA_CHECK(cudaSetDevice(cs->device));
     size_t const words = stride / sizeof(uint64_t);
     size_t const n = bytes / stride;
@@ -968,6 +1182,8 @@ static void arena_dev_scatter(bwc_device_arena * dst, bwc_device_arena * di,
     auto * cd = (arena_ctx *) dst->owner;
     auto * cs = (arena_ctx *) src->owner;
     arena_lock2 const lock(cd, cs);
+    stale_check(src, 0, src->bytes, "a scatter");
+    stale_check(dst, 0, dst->bytes, "a scatter");
     CUDA_CHECK(cudaSetDevice(cd->device));
     ready_wait(dst, cd->stream);
     ready_wait(src, cd->stream);
@@ -989,14 +1205,33 @@ static void arena_mirror(bwc_device_arena * like, void * host, size_t bytes)
     mirror_on(((arena_ctx *) like->owner)->device, host, bytes);
 }
 
+/* The mirror range, and the source replicas with it, which the range
+ * covers whole: a zero of the iterate (mksol, at the start of a block)
+ * keeps the replicas current for the combine that follows. */
 static void arena_set_zero(bwc_device_arena * a, size_t off, size_t bytes)
 {
     auto * c = (arena_ctx *) a->owner;
     std::lock_guard<std::mutex> const lock(c->mtx);
+    stale_clear(a, off, bytes);
+    for (int k = 0; k < c->pieces.nrep; k++) {
+        bwc_dev_piece const & r = c->pieces.rep[k];
+        if (r.off < off || off + bytes < r.off + r.bytes) {
+            fprintf(stderr, "spmv_gf2: the zero of [%zu, %zu) leaves a part"
+                    " of the source replicas [%zu, %zu)\n", off, off + bytes,
+                    r.off, r.off + r.bytes);
+            abort();
+        }
+    }
+    for (arena_copy const & cp : copies_of(a, off, bytes)) {
+        combine_dev & d = combine_on(cp.device);
+        CUDA_CHECK(cudaSetDevice(cp.device));
+        copies_wait(a, d.stream);
+        CUDA_CHECK(cudaMemsetAsync(cp.d, 0, bytes, d.stream));
+        CUDA_CHECK(cudaEventRecord(d.ev, d.stream));
+        CUDA_CHECK(cudaStreamWaitEvent(c->stream, d.ev, 0));
+    }
     CUDA_CHECK(cudaSetDevice(c->device));
-    ready_wait(a, c->stream);
-    CUDA_CHECK(cudaMemsetAsync((char *) a->dev + off, 0, bytes, c->stream));
-    ready_record(a);
+    copies_written(a, off, bytes);
 }
 
 static bwc_device_arena_ops const arena_ops = {
@@ -1093,6 +1328,7 @@ static void arena_make_dev(bwc_device_arena * a, size_t filled)
         CUDA_CHECK(cudaMemcpyAsync((char *) a->dev + filled,
                     (char *) a->host + filled, a->bytes - filled,
                     cudaMemcpyHostToDevice, c->stream));
+        stale_clear(a, filled, a->bytes - filled);
         ready_record(a);
     }
     a->state = BWC_ARENA_DEV;
@@ -1165,6 +1401,47 @@ static void wait_bands(std::vector<bwc_device_band> const & sb,
     for (bwc_device_band const & b : sb)
         if (b.ready && b.off < off + bytes && off < b.off + b.bytes)
             CUDA_CHECK(cudaStreamWaitEvent(s, (cudaEvent_t) b.ready, 0));
+}
+
+/* The write records of the source replica on device (-1: the mirror)
+ * from the last exchange of the arena, in range order; none when a
+ * later write of the mirror made them stale. */
+static std::vector<bwc_device_band> src_writes(bwc_device_arena * a,
+        int device)
+{
+    std::vector<bwc_device_band> wb;
+    bwc_dev_pieces const & p = ((arena_ctx *) a->owner)->pieces;
+    if (p.wb_wgen != p.wgen)
+        return wb;
+    for (int i = 0; i < p.nwb; i++)
+        if (p.wb[i].device == device)
+            wb.push_back({ p.wb[i].off, p.wb[i].bytes, p.wb[i].ready });
+    std::sort(wb.begin(), wb.end(),
+            [](bwc_device_band const & x, bwc_device_band const & y) {
+                return x.off < y.off;
+            });
+    return wb;
+}
+
+/* Make the stream wait until the source range [off, off + bytes) is
+ * complete: on the write records that cover a part of it, and on the
+ * mirror bands for the rest. */
+static void wait_source(std::vector<bwc_device_band> const & sb,
+        std::vector<bwc_device_band> const & wb, cudaStream_t s,
+        size_t off, size_t bytes)
+{
+    size_t const end = off + bytes;
+    size_t at = off;
+    for (bwc_device_band const & w : wb) {
+        if (w.off + w.bytes <= off || end <= w.off)
+            continue;
+        CUDA_CHECK(cudaStreamWaitEvent(s, (cudaEvent_t) w.ready, 0));
+        if (at < w.off)
+            wait_bands(sb, s, at, w.off - at);
+        at = std::max(at, w.off + w.bytes);
+    }
+    if (at < end)
+        wait_bands(sb, s, at, end - at);
 }
 
 /* Copy the mirror range [off, off + bytes) to dst on the device, one
@@ -1296,6 +1573,18 @@ static size_t env_l2_window()
     return s ? (size_t) atol(s) << 20 : 0;
 }
 
+/* SPMV_GF2_SEG_ROWS: the records store their segment sums into a
+ * buffer, and a combine kernel adds the sums of this many rows at a
+ * time into the rows from shared memory; 0 keeps one atomicXor per
+ * record into the row. The default fills 64 KB of accumulators. */
+#define COMBINE_BANDS 256   /* the most bands the combine holds bounds for */
+static unsigned int env_seg_rows(unsigned int words)
+{
+    const char * s = getenv("SPMV_GF2_SEG_ROWS");
+    long const r = s ? atol(s) : 8192 / words;
+    return r > 0 ? (unsigned int) r : 0;
+}
+
 /* set to 0 to keep the plugin on the mirror path: no segment records,
  * no source replicas (measurement switch) */
 static bool env_pieces()
@@ -1322,20 +1611,73 @@ static int env_split_rounds()
     return s ? atoi(s) : 2;
 }
 
+/* SPMV_GF2_SPLIT_COMPOUND=1: each setup round scales the work of the
+ * round before it, not the first estimate, so the scales of a row range
+ * multiply over the rounds */
+static bool env_split_compound()
+{
+    const char * s = getenv("SPMV_GF2_SPLIT_COMPOUND");
+    return s && atoi(s);
+}
+
 /* the product call that splits the rows again on the kernel times of
- * the SPMV_GF2_PROBE_CALLS calls before it; 0 for no such split.  Off
- * by default: at the selected configuration the split is
- * worth nothing outside the run-to-run noise. */
+ * the SPMV_GF2_PROBE_CALLS calls before it, when the replica-local
+ * combine feeds the product (gmksol); 0 for no such split.  The
+ * devices then start their product together, so the kernel time of a
+ * device is its share.  The split loses on the other feeds, gkrylov's
+ * among them. */
 static unsigned long env_resplit_at()
 {
     const char * s = getenv("SPMV_GF2_RESPLIT_AT");
-    return s ? strtoul(s, nullptr, 10) : 0;
+    return s ? strtoul(s, nullptr, 10) : 64;
+}
+
+/* SPMV_GF2_RESPLIT_ANY_FEED=1: the probed split runs on any device
+ * source, not only on the one the combine writes; for gkrylov under
+ * BWC_NCCL_HOLDER, where the allgather readies all replicas at once */
+static bool env_resplit_any_feed()
+{
+    const char * s = getenv("SPMV_GF2_RESPLIT_ANY_FEED");
+    return s && atoi(s);
 }
 
 static unsigned long env_probe_calls()
 {
     const char * s = getenv("SPMV_GF2_PROBE_CALLS");
     return s ? strtoul(s, nullptr, 10) : 32;
+}
+
+/* the calls between the probes after the first (0: one probe only).
+ * Each later probe splits again when its slowest device passes the mean
+ * by SPMV_GF2_RESPLIT_TOL percent, and goes back to the split before,
+ * and stops probing, when a split does not lower the slowest device. */
+static unsigned long env_resplit_every()
+{
+    const char * s = getenv("SPMV_GF2_RESPLIT_EVERY");
+    unsigned long const v = s ? strtoul(s, nullptr, 10) : 0;
+    if (v && v <= env_probe_calls()) {
+        fprintf(stderr, "spmv_gf2: SPMV_GF2_RESPLIT_EVERY %lu is not above"
+                " SPMV_GF2_PROBE_CALLS %lu\n", v, env_probe_calls());
+        abort();
+    }
+    return v;
+}
+
+/* SPMV_GF2_SPLIT_WAIT=1: the probed split also measures the time from
+ * the launch of each product to its end, and gives the kernel time
+ * that each device spends waiting for its source (the span less the
+ * kernel time) to the devices that wait less, so that the products
+ * end together rather than run equal kernel times. */
+static bool env_split_wait()
+{
+    const char * s = getenv("SPMV_GF2_SPLIT_WAIT");
+    return s && atoi(s) == 1;
+}
+
+static double env_resplit_tol()
+{
+    const char * s = getenv("SPMV_GF2_RESPLIT_TOL");
+    return (s ? atof(s) : 2.0) * 1e-2;
 }
 
 /* Run f(t) for t in [0, nthr) on nthr threads. */
@@ -1442,10 +1784,14 @@ static unsigned int setup_threads()
 }
 
 static void split_rows(spmv_gf2 * m, std::vector<uint64_t> const & work,
-        unsigned int nrows);
-static void resplit(spmv_gf2 * m, std::vector<uint64_t> const & work,
-        row_stream const & rs, std::vector<double> const & t,
-        const char * what);
+        unsigned int nrows, std::vector<double> const & share = {});
+static std::vector<uint64_t> resplit(spmv_gf2 * m,
+        std::vector<uint64_t> const & work, row_stream const & rs,
+        std::vector<double> const & t, const char * what,
+        std::vector<double> const & share);
+static void split_back(spmv_gf2 * m,
+        std::vector<std::pair<unsigned int, unsigned int>> const & split,
+        row_stream const & rs);
 static void pieces_release(spmv_gf2 * m, const bwc_device_arena * a);
 static void build_dev(spmv_gf2 * m, spmv_dev & dev, row_stream const & rs);
 static void build_all(spmv_gf2 * m, row_stream const & rs);
@@ -1454,6 +1800,7 @@ static void sync_all(spmv_gf2 * m);
 static std::vector<double> trial_gather(spmv_gf2 * m, unsigned int max_dim);
 static void launch_gather(spmv_gf2 * m, spmv_dev & dev,
         bwc_device_arena * asrc, std::vector<bwc_device_band> const & sb,
+        std::vector<bwc_device_band> const & wb,
         const uint64_t * src, uint64_t * dst, size_t src_bytes, bool copy,
         std::vector<gather_seg *> const & segs);
 
@@ -1687,7 +2034,9 @@ spmv_gf2 * spmv_gf2_new(unsigned int nrows, uint64_t nwords,
         for (int d = 0; d < ngpu; d++)
             prev[d] = { m->devs[d].row0, m->devs[d].nrows };
         double const before = *std::max_element(t.begin(), t.end());
-        resplit(m, work, rs, t, "split round");
+        std::vector<uint64_t> scaled = resplit(m, work, rs, t, "split round", {});
+        if (env_split_compound())
+            work.swap(scaled);
         phase("rebuild");
         t = trial_gather(m, max_dim);
         phase("trial");
@@ -1699,12 +2048,9 @@ spmv_gf2 * spmv_gf2_new(unsigned int nrows, uint64_t nwords,
                     after < before ? "" : "; kept the split before");
         if (after < before)
             continue;
-        for (int d = 0; d < ngpu; d++) {
-            free_dev(m->devs[d]);
-            m->devs[d].row0 = prev[d].first;
-            m->devs[d].nrows = prev[d].second;
-        }
-        build_all(m, rs);
+        split_back(m, prev, rs);
+        if (env_split_compound())
+            work.swap(scaled);
         phase("rebuild of the split before");
         break;
     }
@@ -1728,10 +2074,11 @@ spmv_gf2 * spmv_gf2_new(unsigned int nrows, uint64_t nwords,
 /* Split the rows again on the measured time t of each device: the
  * estimated work of its rows scales to its time, so the new split
  * gives every device the same measured time, and the devices
- * rebuild. */
-static void resplit(spmv_gf2 * m, std::vector<uint64_t> const & work,
-        row_stream const & rs, std::vector<double> const & t,
-        const char * what)
+ * rebuild.  Returns the scaled work. */
+static std::vector<uint64_t> resplit(spmv_gf2 * m,
+        std::vector<uint64_t> const & work, row_stream const & rs,
+        std::vector<double> const & t, const char * what,
+        std::vector<double> const & share)
 {
     std::vector<uint64_t> scaled(m->nrows + 1);
     for (size_t d = 0; d < m->devs.size(); d++) {
@@ -1750,7 +2097,21 @@ static void resplit(spmv_gf2 * m, std::vector<uint64_t> const & work,
                     (unsigned long) w, t[d] * 1e3);
         free_dev(dev);
     }
-    split_rows(m, scaled, m->nrows);
+    split_rows(m, scaled, m->nrows, share);
+    build_all(m, rs);
+    return scaled;
+}
+
+/* the devices rebuild on the row ranges of an earlier split */
+static void split_back(spmv_gf2 * m,
+        std::vector<std::pair<unsigned int, unsigned int>> const & split,
+        row_stream const & rs)
+{
+    for (size_t d = 0; d < m->devs.size(); d++) {
+        free_dev(m->devs[d]);
+        m->devs[d].row0 = split[d].first;
+        m->devs[d].nrows = split[d].second;
+    }
     build_all(m, rs);
 }
 
@@ -1773,12 +2134,21 @@ static void probe_collect(spmv_gf2 * m)
             continue;
         CUDA_CHECK(cudaSetDevice(dev.device));
         CUDA_CHECK(cudaEventSynchronize(dev.pe[dev.npe - 1]));
+        double busy = 0;
         for (size_t i = 0; i < dev.npe; i += 2) {
             float ms;
             CUDA_CHECK(cudaEventElapsedTime(&ms, dev.pe[i], dev.pe[i + 1]));
-            dev.busy += ms * 1e-3;
+            busy += ms * 1e-3;
         }
+        dev.busy += busy;
         dev.npe = 0;
+        if (dev.spanned) {
+            float ms;
+            CUDA_CHECK(cudaEventSynchronize(dev.span[1]));
+            CUDA_CHECK(cudaEventElapsedTime(&ms, dev.span[0], dev.span[1]));
+            dev.wait += ms * 1e-3 - busy;
+            dev.spanned = false;
+        }
     }
 }
 
@@ -1797,25 +2167,81 @@ static void probe_release(spmv_gf2 * m)
     m->probe1 = 0;
 }
 
-static void resplit_probed(spmv_gf2 * m)
+static void resplit_probed(spmv_gf2 * m, bwc_device_arena * asrc)
 {
     probe_collect(m);
     if (m->calls != m->probe1)
         return;
-    for (auto const & v : m->vdst)
-        pieces_release(m, v.first);
-    sync_all(m);
-    std::vector<double> t;
-    for (spmv_dev & dev : m->devs)
+    if (!asrc || !(((arena_ctx *) asrc->owner)->combined
+                || env_resplit_any_feed())) {
+        probe_release(m);
+        return;
+    }
+    std::vector<double> t, w;
+    for (spmv_dev & dev : m->devs) {
         t.push_back(dev.busy / (double) (m->probe1 - m->probe0));
-    resplit(m, m->work, m->rs, t, "probed split");
-    probe_release(m);
+        w.push_back(dev.wait / (double) (m->probe1 - m->probe0));
+        dev.busy = 0;
+        dev.wait = 0;
+    }
+    /* the devices end together when each runs the mean span less its
+     * own wait */
+    std::vector<double> share;
+    if (env_split_wait()) {
+        double span = 0;
+        for (size_t d = 0; d < t.size(); d++)
+            span += (t[d] + w[d]) / (double) t.size();
+        for (size_t d = 0; d < t.size(); d++) {
+            share.push_back(std::max(span - w[d], 0.1 * span));
+            if (getenv("SPMV_GF2_TIMING"))
+                fprintf(stderr, "spmv_gf2 probed wait dev%d: kernel %.3f ms"
+                        " wait %.3f ms share %.3f ms\n", (int) d,
+                        t[d] * 1e3, w[d] * 1e3, share[d] * 1e3);
+        }
+    }
+    unsigned long const every = env_resplit_every();
+    double const slowest = *std::max_element(t.begin(), t.end());
+    double mean = 0;
+    for (double x : t)
+        mean += x / (double) t.size();
+    bool const timing = getenv("SPMV_GF2_TIMING");
+    if (timing && every)
+        fprintf(stderr, "spmv_gf2 probe at call %lu: slowest device %.3f ms,"
+                " mean %.3f ms\n", m->calls, slowest * 1e3, mean * 1e3);
+    bool const back = !m->split_before.empty() && slowest >= m->slowest_before;
+    bool const split = !every || (!back && slowest > mean * (1 + env_resplit_tol()));
+    if (!back && !split) {
+        m->split_before.clear();
+    } else {
+        for (auto const & v : m->vdst)
+            pieces_release(m, v.first);
+        sync_all(m);
+        double const t0 = now();
+        if (back) {
+            split_back(m, m->split_before, m->rs);
+        } else {
+            m->split_before.clear();
+            for (spmv_dev const & dev : m->devs)
+                m->split_before.emplace_back(dev.row0, dev.nrows);
+            m->slowest_before = slowest;
+            m->work = resplit(m, m->work, m->rs, t, "probed split", share);
+        }
+        if (timing)
+            fprintf(stderr, "spmv_gf2 %s at call %lu in %.3f s\n",
+                    back ? "split back" : "probed split", m->calls, now() - t0);
+    }
+    if (!every || back) {
+        probe_release(m);
+        return;
+    }
+    m->probe1 += every;
+    m->probe0 = m->probe1 - env_probe_calls();
 }
 
 /* Give each device a contiguous row range with about the same share
  * of the cumulative work; with one device, all the rows. */
 static void split_rows(spmv_gf2 * m, std::vector<uint64_t> const & work,
-        unsigned int nrows)
+        unsigned int nrows, std::vector<double> const & share)
 {
     int const ngpu = (int) m->devs.size();
     unsigned int row0 = 0;
@@ -1824,8 +2250,13 @@ static void split_rows(spmv_gf2 * m, std::vector<uint64_t> const & work,
         dev.row0 = row0;
         unsigned int row1 = nrows;
         if (d + 1 < ngpu) {
-            uint64_t const target = work[row0]
-                + (work[nrows] - work[row0]) / (ngpu - d);
+            double rest = 0;
+            for (int e = d; e < ngpu && !share.empty(); e++)
+                rest += share[e];
+            double const frac = share.empty()
+                ? 1.0 / (ngpu - d) : share[d] / rest;
+            uint64_t const target = work[row0] + (uint64_t)
+                ((double) (work[nrows] - work[row0]) * frac);
             row1 = std::lower_bound(work.begin() + row0 + 1, work.end(),
                     target) - work.begin();
         }
@@ -1847,8 +2278,10 @@ static void build_all(spmv_gf2 * m, row_stream const & rs)
 static void segs_release(spmv_dev & dev)
 {
     CUDA_CHECK(cudaSetDevice(dev.device));
-    for (gather_seg & s : dev.segs)
+    for (gather_seg & s : dev.segs) {
         CUDA_CHECK(cudaEventDestroy(s.ev));
+        CUDA_CHECK(cudaFree(s.rs));
+    }
     dev.segs.clear();
     dev.seg_bytes = SIZE_MAX;
 }
@@ -1896,13 +2329,36 @@ static void segs_cut(spmv_gf2 * m, spmv_dev & dev, size_t blk_bytes)
         int const blk = (int) (r0 / bw);
         auto const r1 = (unsigned int) std::min<uint64_t>(row1,
                 (blk + 1) * bw);
-        gather_seg s { blk, r0, r1, {}, nullptr };
+        gather_seg s { blk, r0, r1, {}, {}, nullptr, 0, nullptr };
+        auto range = [&](std::vector<uint32_t> const & rows,
+                std::vector<uint64_t> const & first, unsigned int b) {
+            auto const lo = rows.begin() + first[b];
+            auto const hi = rows.begin() + first[b + 1];
+            return std::pair<uint64_t, uint64_t>(
+                    std::lower_bound(lo, hi, r0 - dev.row0) - rows.begin(),
+                    std::lower_bound(lo, hi, r1 - dev.row0) - rows.begin());
+        };
         for (unsigned int b = 0; b < m->nbands; b++) {
-            auto const lo = dev.chunk_row.begin() + dev.chunk0[b];
-            auto const hi = dev.chunk_row.begin() + dev.chunk0[b + 1];
-            s.c.emplace_back(
-                    std::lower_bound(lo, hi, r0 - dev.row0) - dev.chunk_row.begin(),
-                    std::lower_bound(lo, hi, r1 - dev.row0) - dev.chunk_row.begin());
+            s.c.push_back(range(dev.chunk_row, dev.chunk0, b));
+            s.r.push_back(range(dev.rec_row, dev.rec0, b));
+        }
+        if (dev.segbuf) {
+            /* the combine table: the row blocks of the segment cut the
+             * record range of each band */
+            unsigned int const R = env_seg_rows(m->words);
+            s.nblk = (r1 - r0 + R - 1) / R;
+            std::vector<uint32_t> rs((size_t) m->nbands * (s.nblk + 1));
+            for (unsigned int b = 0; b < m->nbands; b++) {
+                auto const lo = dev.rec_row.begin() + s.r[b].first;
+                auto const hi = dev.rec_row.begin() + s.r[b].second;
+                for (unsigned int k = 0; k <= s.nblk; k++)
+                    rs[(size_t) b * (s.nblk + 1) + k] = (uint32_t)
+                        (std::lower_bound(lo, hi, r0 - dev.row0 + (uint64_t) k * R)
+                         - dev.rec_row.begin());
+            }
+            CUDA_CHECK(cudaMalloc(&s.rs, rs.size() * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMemcpy(s.rs, rs.data(),
+                        rs.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
         }
         CUDA_CHECK(cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming));
         dev.segs.push_back(std::move(s));
@@ -1977,26 +2433,87 @@ static void build_dev(spmv_gf2 * m, spmv_dev & dev, row_stream const & rs)
             }
         });
 
-        /* the gather chunk list; an empty row has no chunk and keeps
-         * the zero that launch_gather writes */
-        std::vector<gather_chunk> chunks;
+        /* the gather chunk and record lists; an empty row has neither
+         * and keeps the zero that launch_gather writes */
+        if (dev.nrows > REC_ROW) {
+            fprintf(stderr, "spmv_gf2: too many rows for the gather records\n");
+            abort();
+        }
+        /* the chunk and record counts of each band, then the fill of
+         * each band on a thread of its own */
         uint64_t const chunk = env_gather_chunk();
-        dev.chunk0.resize(nbands + 1);
-        for (unsigned int b = 0; b < nbands; b++) {
-            dev.chunk0[b] = chunks.size();
+        bool const seg = env_seg_rows(m->words) > 0;
+        std::vector<uint64_t> nch(nbands), nrec(nbands), nrcol(nbands);
+        for_threads(nbands, [&](unsigned int b) {
             for (unsigned int i = 0; i < dev.nrows; i++) {
-                uint64_t const rend = local[(size_t) b * N1 + i + 1];
-                for (uint64_t s = local[(size_t) b * N1 + i]; s < rend;
-                        s += chunk) {
-                    uint64_t const e = std::min(rend, s + chunk);
-                    chunks.push_back({ s, (uint32_t) (e - s), i });
+                uint64_t const len = local[(size_t) b * N1 + i + 1]
+                    - local[(size_t) b * N1 + i];
+                if (len > REC_COLS) {
+                    nch[b] += (len + chunk - 1) / chunk;
+                } else if (len) {
+                    nrec[b]++;
+                    nrcol[b] += len;
                 }
             }
+        });
+        dev.chunk0.assign(nbands + 1, 0);
+        dev.rec0.assign(nbands + 1, 0);
+        dev.rcol0.assign(nbands + 1, 0);
+        for (unsigned int b = 0; b < nbands; b++) {
+            dev.chunk0[b + 1] = dev.chunk0[b] + nch[b];
+            dev.rec0[b + 1] = dev.rec0[b] + nrec[b];
+            dev.rcol0[b + 1] = dev.rcol0[b] + nrcol[b];
         }
-        dev.chunk0[nbands] = chunks.size();
+        size_t const nrecs = dev.rec0[nbands];
+        if (seg && (nrecs + nbands > UINT32_MAX || nbands > COMBINE_BANDS
+                    || *std::max_element(nrcol.begin(), nrcol.end())
+                    > UINT32_MAX)) {
+            fprintf(stderr, "spmv_gf2: too many records or bands for the"
+                    " segment buffer\n");
+            abort();
+        }
+        std::vector<gather_chunk> chunks(dev.chunk0[nbands]);
+        /* the inline records, or the slim ones: the column runs of a
+         * band's records, and their bounds */
+        std::unique_ptr<gather_rec[]> const recs(
+                new gather_rec[seg ? 0 : nrecs]);
+        size_t const nrptr = seg ? nrecs + nbands : 0;
+        size_t const nrcols = seg ? dev.rcol0[nbands] : 0;
+        std::unique_ptr<uint32_t[]> const rptr(new uint32_t[nrptr]);
+        std::unique_ptr<uint32_t[]> const rcols(new uint32_t[nrcols]);
         dev.chunk_row.resize(chunks.size());
-        for (size_t k = 0; k < chunks.size(); k++)
-            dev.chunk_row[k] = chunks[k].row;
+        dev.rec_row.resize(nrecs);
+        for_threads(nbands, [&](unsigned int b) {
+            uint64_t c = dev.chunk0[b], r = dev.rec0[b];
+            uint32_t q = 0;
+            for (unsigned int i = 0; i < dev.nrows; i++) {
+                uint64_t const rbeg = local[(size_t) b * N1 + i];
+                uint64_t const rend = local[(size_t) b * N1 + i + 1];
+                if (rbeg == rend)
+                    continue;
+                if (rend - rbeg <= REC_COLS) {
+                    if (seg) {
+                        rptr[r + b] = q;
+                        std::copy(bc.data() + rbeg, bc.data() + rend,
+                                rcols.get() + dev.rcol0[b] + q);
+                        q += (uint32_t) (rend - rbeg);
+                    } else {
+                        recs[r] = { (uint32_t) (rend - rbeg) << 28 | i, {} };
+                        std::copy(bc.data() + rbeg, bc.data() + rend,
+                                recs[r].col);
+                    }
+                    dev.rec_row[r++] = i;
+                    continue;
+                }
+                for (uint64_t s = rbeg; s < rend; s += chunk) {
+                    uint64_t const e = std::min(rend, s + chunk);
+                    chunks[c] = { s, (uint32_t) (e - s), i };
+                    dev.chunk_row[c++] = i;
+                }
+            }
+            if (seg)
+                rptr[r + b] = q;
+        });
         if (env_chunk_col_order()) {
             dev.chunk_col.resize(chunks.size());
             for (size_t k = 0; k < chunks.size(); k++)
@@ -2013,9 +2530,32 @@ static void build_dev(spmv_gf2 * m, spmv_dev & dev, row_stream const & rs)
         CUDA_CHECK(cudaMemcpy(dev.cols, bc.data(),
                     nloc * sizeof(uint32_t), cudaMemcpyHostToDevice));
         size_t const nchunks = chunks.size();
-        CUDA_CHECK(cudaMalloc(&dev.chunks, nchunks * sizeof(gather_chunk)));
-        CUDA_CHECK(cudaMemcpy(dev.chunks, chunks.data(),
-                    nchunks * sizeof(gather_chunk), cudaMemcpyHostToDevice));
+        if (nchunks) {
+            CUDA_CHECK(cudaMalloc(&dev.chunks, nchunks * sizeof(gather_chunk)));
+            CUDA_CHECK(cudaMemcpy(dev.chunks, chunks.data(),
+                        nchunks * sizeof(gather_chunk), cudaMemcpyHostToDevice));
+        }
+        if (nrecs && seg) {
+            CUDA_CHECK(cudaMalloc(&dev.rptr, nrptr * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&dev.rcols, nrcols * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&dev.rrow, nrecs * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&dev.segbuf,
+                        nrecs * m->words * sizeof(uint64_t)));
+            CUDA_CHECK(cudaMemcpy(dev.rptr, rptr.get(),
+                        nrptr * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(dev.rcols, rcols.get(),
+                        nrcols * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(dev.rrow, dev.rec_row.data(),
+                        nrecs * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        } else if (nrecs) {
+            CUDA_CHECK(cudaMalloc(&dev.recs, nrecs * sizeof(gather_rec)));
+            if ((uintptr_t) dev.recs % alignof(gather_rec)) {
+                fprintf(stderr, "spmv_gf2: the gather records are not aligned\n");
+                abort();
+            }
+            CUDA_CHECK(cudaMemcpy(dev.recs, recs.get(),
+                        nrecs * sizeof(gather_rec), cudaMemcpyHostToDevice));
+        }
     }
 }
 
@@ -2027,9 +2567,19 @@ static void free_dev(spmv_dev & dev)
     CUDA_CHECK(cudaFree(dev.rowptr));
     CUDA_CHECK(cudaFree(dev.cols));
     CUDA_CHECK(cudaFree(dev.chunks));
+    CUDA_CHECK(cudaFree(dev.recs));
+    CUDA_CHECK(cudaFree(dev.rptr));
+    CUDA_CHECK(cudaFree(dev.rcols));
+    CUDA_CHECK(cudaFree(dev.rrow));
+    CUDA_CHECK(cudaFree(dev.segbuf));
     dev.rowptr = nullptr;
     dev.cols = nullptr;
     dev.chunks = nullptr;
+    dev.recs = nullptr;
+    dev.rptr = nullptr;
+    dev.rcols = nullptr;
+    dev.rrow = nullptr;
+    dev.segbuf = nullptr;
 }
 
 /* The product time of each device on a full-width source of set bits,
@@ -2093,7 +2643,7 @@ static std::vector<double> trial_gather(spmv_gf2 * m, unsigned int max_dim)
              * behind the product step before; this puts the copies in
              * the window */
             CUDA_CHECK(cudaEventRecord(dev.ev, dev.stream));
-            launch_gather(m, dev, &asrc, sb, vsrc[d], vdst[d], bytes, under,
+            launch_gather(m, dev, &asrc, sb, {}, vsrc[d], vdst[d], bytes, under,
                     segs_ordered(m, dev, nullptr));
             if (d)
                 CUDA_CHECK(cudaMemcpyPeerAsync(
@@ -2133,12 +2683,13 @@ static std::vector<double> trial_gather(spmv_gf2 * m, unsigned int max_dim)
  * chunk.  For W=4 a lane pair shares each entry, so the two 16-byte
  * loads of one 32-byte element land in one L1 sector access.  Each
  * lane keeps four gathers in flight, which hides part of the latency
- * of the scattered src reads.  The cols entries stream through the
- * cache with no reuse, so they load with the evict-first hint.  The
- * partial results of one row meet in dst through atomicXor, which
- * starts from the zero that launch_gather writes; xor is associative
- * and commutative, so the result does not depend on the atomic
- * order. */
+ * of the scattered src reads.  The first lane of a subwarp loads the
+ * chunk descriptor into shared memory for the other lanes.  The cols
+ * entries stream through the cache with no reuse, so they load with
+ * the evict-first hint.  The partial results of one row meet in dst
+ * through atomicXor, which starts from the zero that launch_gather
+ * writes; xor is associative and commutative, so the result does not
+ * depend on the atomic order. */
 template <int W, int D>
 __global__ void gather_kernel(const gather_chunk * chunks,
                               const uint32_t * cols, const uint64_t * src,
@@ -2148,12 +2699,24 @@ __global__ void gather_kernel(const gather_chunk * chunks,
     constexpr int P = W == 4 ? 2 : 1;   /* lanes per entry */
     constexpr int A = W / P;            /* words per lane */
     constexpr int S = G / P;            /* entries per step */
+    extern __shared__ uint64_t desc[];
     unsigned int const c = (blockIdx.x * blockDim.x + threadIdx.x) / G;
-    if (c >= nchunks) return;
     unsigned int const lane = threadIdx.x % G;
     unsigned int const mask =
         (unsigned int) ((1ull << G) - 1) << (threadIdx.x % 32 / G * G);
-    gather_chunk const g = chunks[c];
+    /* the shared memory has no 16-byte alignment, so the descriptor
+     * goes there as its two words; the subwarps past the last chunk
+     * still meet the barrier */
+    unsigned int const d = threadIdx.x / G * 2;
+    if (lane == 0 && c < nchunks) {
+        ulonglong2 const x = ((const ulonglong2 *) chunks)[c];
+        desc[d] = x.x;
+        desc[d + 1] = x.y;
+    }
+    __syncthreads();
+    if (c >= nchunks) return;
+    gather_chunk const g { desc[d], (uint32_t) desc[d + 1],
+        (uint32_t) (desc[d + 1] >> 32) };
     uint64_t const end = g.start + g.len;
     uint64_t acc[A] = {};
     for (uint64_t k = g.start + lane / P; k < end; k += D * S) {
@@ -2189,6 +2752,170 @@ __global__ void gather_kernel(const gather_chunk * chunks,
                     &dst[(size_t) g.row * W + lane * A + w],
                     (unsigned long long) acc[w]);
     }
+}
+
+/* One thread per record: one load gives the row and its columns, the
+ * source loads of the columns go out together, and one atomicXor per
+ * word adds the segment into dst. */
+template <int W>
+__global__ void record_kernel(const gather_rec * recs, const uint64_t * src,
+                              uint64_t * dst, unsigned int nrecs)
+{
+    unsigned int const r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= nrecs) return;
+    gather_rec const g = recs[r];
+    int const len = (int) (g.row >> 28);
+    uint64_t v[REC_COLS][W] = {};
+#pragma unroll
+    for (int u = 0; u < REC_COLS; u++) {
+        if (u >= len) continue;
+        if constexpr (W % 2 == 0) {
+            for (int h = 0; h < W / 2; h++) {
+                ulonglong2 const x = ((const ulonglong2 *) src)
+                    [(size_t) g.col[u] * (W / 2) + h];
+                v[u][2 * h] = x.x;
+                v[u][2 * h + 1] = x.y;
+            }
+        } else {
+            v[u][0] = src[(size_t) g.col[u]];
+        }
+    }
+    uint64_t acc[W] = {};
+    for (int u = 0; u < REC_COLS; u++)
+        for (int w = 0; w < W; w++)
+            acc[w] ^= v[u][w];
+    for (int w = 0; w < W; w++)
+        atomicXor((unsigned long long *)
+                &dst[(size_t) (g.row & REC_ROW) * W + w],
+                (unsigned long long) acc[w]);
+}
+
+/* One thread per slim record: its columns are cols[ptr[r] .. ptr[r +
+ * 1]), the source loads go out together, and the segment sum is stored
+ * at seg[r] for the combine.  The stores are sequential, so the
+ * updates of the rows, which the records reach at random, wait for
+ * the combine. */
+template <int W>
+__global__ void slim_kernel(const uint32_t * ptr, const uint32_t * cols,
+                            const uint64_t * src, uint64_t * seg,
+                            unsigned int nrecs)
+{
+    unsigned int const r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= nrecs) return;
+    uint32_t const p0 = __ldcs(ptr + r), p1 = __ldcs(ptr + r + 1);
+    int const len = (int) (p1 - p0);
+    uint32_t col[REC_COLS];
+#pragma unroll
+    for (int u = 0; u < REC_COLS; u++)
+        col[u] = u < len ? __ldcs(cols + p0 + u) : 0;
+    uint64_t v[REC_COLS][W] = {};
+#pragma unroll
+    for (int u = 0; u < REC_COLS; u++) {
+        if (u >= len) continue;
+        if constexpr (W % 2 == 0) {
+            for (int h = 0; h < W / 2; h++) {
+                ulonglong2 const x = ((const ulonglong2 *) src)
+                    [(size_t) col[u] * (W / 2) + h];
+                v[u][2 * h] = x.x;
+                v[u][2 * h + 1] = x.y;
+            }
+        } else {
+            v[u][0] = src[(size_t) col[u]];
+        }
+    }
+    uint64_t acc[W] = {};
+    for (int u = 0; u < REC_COLS; u++)
+        for (int w = 0; w < W; w++)
+            acc[w] ^= v[u][w];
+    if constexpr (W % 2 == 0) {
+        for (int h = 0; h < W / 2; h++)
+            ((ulonglong2 *) seg)[(size_t) r * (W / 2) + h] =
+                make_ulonglong2(acc[2 * h], acc[2 * h + 1]);
+    } else {
+        seg[r] = acc[0];
+    }
+}
+
+/* Block k of the combine adds the segment sums of the rows [r0 + k R,
+ * r0 + (k + 1) R) of the segment into dst: band by band, the records
+ * of those rows (one run of the band's records, with distinct rows) go
+ * into the block's shared accumulators, and at the end each row takes
+ * one xor-store.  rs[b (nblk + 1) + k] is the first record of band b
+ * whose row is at or past block k.  A thread loads its first record of
+ * the next band before the barrier, so the load overlaps the wait. */
+
+/* the W words of segment sum k, a streaming load */
+template <int W>
+__device__ __forceinline__ void seg_load(const uint64_t * seg, size_t k,
+        uint64_t (&v)[W])
+{
+    if constexpr (W % 2 == 0) {
+        for (int h = 0; h < W / 2; h++) {
+            ulonglong2 const x =
+                __ldcs((const ulonglong2 *) seg + k * (W / 2) + h);
+            v[2 * h] = x.x;
+            v[2 * h + 1] = x.y;
+        }
+    } else {
+        v[0] = __ldcs(seg + k);
+    }
+}
+
+template <int W>
+__global__ void __launch_bounds__(1024)
+combine_kernel(const uint32_t * rs, const uint32_t * rrow,
+               const uint64_t * seg, uint64_t * dst, unsigned int nbands,
+               unsigned int nblk, unsigned int R, unsigned int r0,
+               unsigned int r1)
+{
+    extern __shared__ uint64_t acc[];       /* R * W */
+    __shared__ uint32_t run[2 * COMBINE_BANDS];
+    unsigned int const rb = r0 + blockIdx.x * R;
+    unsigned int const n = min(R, r1 - rb);
+    for (unsigned int i = threadIdx.x; i < n * W; i += blockDim.x)
+        acc[i] = 0;
+    for (unsigned int t = threadIdx.x; t < 2 * nbands; t += blockDim.x)
+        run[t] = rs[(t >> 1) * (nblk + 1) + blockIdx.x + (t & 1)];
+    __syncthreads();
+    uint32_t s = run[0], e = run[1];
+    uint64_t v[W] = {};
+    unsigned int i = UINT32_MAX;
+    if (s + threadIdx.x < e) {
+        seg_load<W>(seg, s + threadIdx.x, v);
+        i = __ldcs(rrow + s + threadIdx.x) - rb;
+    }
+    for (unsigned int b = 0; b < nbands; b++) {
+        uint32_t ns = 0, ne = 0;
+        uint64_t nv[W] = {};
+        unsigned int ni = UINT32_MAX;
+        if (b + 1 < nbands) {
+            ns = run[2 * b + 2];
+            ne = run[2 * b + 3];
+            if (ns + threadIdx.x < ne) {
+                seg_load<W>(seg, ns + threadIdx.x, nv);
+                ni = __ldcs(rrow + ns + threadIdx.x) - rb;
+            }
+        }
+        __syncthreads();
+        if (i != UINT32_MAX)
+            for (int w = 0; w < W; w++)
+                acc[(size_t) i * W + w] ^= v[w];
+        for (uint32_t j = s + threadIdx.x + blockDim.x; j < e; j += blockDim.x) {
+            unsigned int const k = __ldcs(rrow + j) - rb;
+            uint64_t x[W];
+            seg_load<W>(seg, j, x);
+            for (int w = 0; w < W; w++)
+                acc[(size_t) k * W + w] ^= x[w];
+        }
+        s = ns;
+        e = ne;
+        for (int w = 0; w < W; w++)
+            v[w] = nv[w];
+        i = ni;
+    }
+    __syncthreads();
+    for (unsigned int i = threadIdx.x; i < n * W; i += blockDim.x)
+        dst[(size_t) rb * W + i] ^= acc[i];
 }
 
 template <int W>
@@ -2257,12 +2984,12 @@ __global__ void dotprod64_kernel(const uint64_t * y, size_t words,
 }
 
 /* dst[i] ^= xor over the sources j and the set bits k of s.p[j][i] of
- * f[64 j + k]: one byte-indexed table of 256 words per source and
- * byte, built in shared memory by each block, then eight lookups per
- * source word */
+ * f[64 j + k] (dst[i] = that xor when acc is 0): one byte-indexed table
+ * of 256 words per source and byte, built in shared memory by each
+ * block, then eight lookups per source word */
 __global__ void addmul64_kernel(uint64_t * dst, addmul64_srcs s,
                                 const uint64_t * f, unsigned int nsrc,
-                                unsigned int n)
+                                unsigned int n, unsigned int acc)
 {
     extern __shared__ uint64_t tab[];
     for (unsigned int e = threadIdx.x; e < nsrc * 2048; e += blockDim.x) {
@@ -2276,7 +3003,7 @@ __global__ void addmul64_kernel(uint64_t * dst, addmul64_srcs s,
     __syncthreads();
     for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
             i += gridDim.x * blockDim.x) {
-        uint64_t r = dst[i];
+        uint64_t r = acc ? dst[i] : 0;
         for (unsigned int j = 0; j < nsrc; j++) {
             uint64_t const a = s.p[j][i];
             const uint64_t * t = tab + j * 2048;
@@ -2293,7 +3020,7 @@ __global__ void addmul64_kernel(uint64_t * dst, addmul64_srcs s,
  * per source word instead of eight (SPMV_GF2_ADDMUL64=nibble) */
 __global__ void addmul64_nibble_kernel(uint64_t * dst, addmul64_srcs s,
                                        const uint64_t * f, unsigned int nsrc,
-                                       unsigned int n)
+                                       unsigned int n, unsigned int acc)
 {
     extern __shared__ uint64_t tab[];
     for (unsigned int e = threadIdx.x; e < nsrc * 256; e += blockDim.x) {
@@ -2307,7 +3034,7 @@ __global__ void addmul64_nibble_kernel(uint64_t * dst, addmul64_srcs s,
     __syncthreads();
     for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
             i += gridDim.x * blockDim.x) {
-        uint64_t r = dst[i];
+        uint64_t r = acc ? dst[i] : 0;
         for (unsigned int j = 0; j < nsrc; j++) {
             uint64_t const a = s.p[j][i];
             const uint64_t * t = tab + j * 256;
@@ -2349,6 +3076,14 @@ typedef void gather_kern(const gather_chunk *, const uint32_t *,
                          const uint64_t *, uint64_t *, unsigned int);
 typedef void scatter_kern(const uint64_t *, const uint32_t *,
                           const uint64_t *, uint64_t *, unsigned int);
+typedef void record_kern(const gather_rec *, const uint64_t *, uint64_t *,
+                         unsigned int);
+typedef void slim_kern(const uint32_t *, const uint32_t *, const uint64_t *,
+                       uint64_t *, unsigned int);
+typedef void combine_kern(const uint32_t *, const uint32_t *,
+                          const uint64_t *, uint64_t *, unsigned int,
+                          unsigned int, unsigned int, unsigned int,
+                          unsigned int);
 
 template <int W>
 static gather_kern * gather_depth()
@@ -2374,6 +3109,53 @@ static gather_kern * gather_for(unsigned int words)
     abort();
 }
 
+static record_kern * record_for(unsigned int words)
+{
+    switch (words) {
+        case 1: return record_kernel<1>;
+        case 2: return record_kernel<2>;
+        case 4: return record_kernel<4>;
+    }
+    fprintf(stderr, "spmv_gf2: unsupported element width\n");
+    abort();
+}
+
+static slim_kern * slim_for(unsigned int words)
+{
+    switch (words) {
+        case 1: return slim_kernel<1>;
+        case 2: return slim_kernel<2>;
+        case 4: return slim_kernel<4>;
+    }
+    fprintf(stderr, "spmv_gf2: unsupported element width\n");
+    abort();
+}
+
+/* The combine kernel of the width, with its shared memory (R rows of
+ * accumulators) allowed once per device. */
+static combine_kern * combine_for(spmv_dev & dev, unsigned int words,
+        unsigned int R)
+{
+    combine_kern * k = nullptr;
+    switch (words) {
+        case 1: k = combine_kernel<1>; break;
+        case 2: k = combine_kernel<2>; break;
+        case 4: k = combine_kernel<4>; break;
+    }
+    if (!k) {
+        fprintf(stderr, "spmv_gf2: unsupported element width\n");
+        abort();
+    }
+    static std::mutex mtx;
+    static std::set<std::pair<int, combine_kern *>> allowed;
+    std::lock_guard<std::mutex> const lock(mtx);
+    if (allowed.insert({ dev.device, k }).second)
+        CUDA_CHECK(cudaFuncSetAttribute(k,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    (int) (R * words * sizeof(uint64_t))));
+    return k;
+}
+
 static scatter_kern * scatter_for(unsigned int words)
 {
     switch (words) {
@@ -2393,6 +3175,7 @@ static scatter_kern * scatter_for(unsigned int words)
  * the earlier bands. */
 static void launch_gather(spmv_gf2 * m, spmv_dev & dev,
         bwc_device_arena * asrc, std::vector<bwc_device_band> const & sb,
+        std::vector<bwc_device_band> const & wb,
         const uint64_t * src, uint64_t * dst, size_t src_bytes, bool copy,
         std::vector<gather_seg *> const & segs)
 {
@@ -2401,6 +3184,11 @@ static void launch_gather(spmv_gf2 * m, spmv_dev & dev,
                 (size_t) dev.nrows * m->words * sizeof(uint64_t),
                 dev.stream));
     gather_kern * const kern = gather_for(m->words);
+    record_kern * const rkern = dev.recs ? record_for(m->words) : nullptr;
+    slim_kern * const skern = dev.segbuf ? slim_for(m->words) : nullptr;
+    unsigned int const R = env_seg_rows(m->words);
+    combine_kern * const ckern =
+        dev.segbuf ? combine_for(dev, m->words, R) : nullptr;
     bool const probe = m->calls >= m->probe0 && m->calls < m->probe1;
     unsigned int const warps = env_gather_warps();
     unsigned int const cpb = 32 * warps / GATHER_LANES;
@@ -2410,7 +3198,8 @@ static void launch_gather(spmv_gf2 * m, spmv_dev & dev,
     for (gather_seg * s : segs) {
         for (unsigned int b = 0; b < m->nbands; b++) {
             auto const n = (unsigned int) (s->c[b].second - s->c[b].first);
-            if (!n) continue;
+            auto const nr = (unsigned int) (s->r[b].second - s->r[b].first);
+            if (!n && !nr) continue;
             if (!in[b]) {
                 in[b] = true;
                 size_t const lo = std::min(b * bb, src_bytes);
@@ -2418,17 +3207,40 @@ static void launch_gather(spmv_gf2 * m, spmv_dev & dev,
                 if (copy)
                     copy_bands(asrc, sb, dev, (char *) src + lo, lo, hi - lo);
                 else if (!sb.empty())
-                    wait_bands(sb, dev.stream, lo, hi - lo);
+                    wait_source(sb, wb, dev.stream, lo, hi - lo);
                 if (l2win)
                     l2_window(dev, (const char *) src + lo,
                             std::min(l2win, hi - lo));
                 tl_mark(tlg, dev.stream, dev.device, tl_name("g in", b), m->calls);
             }
-            unsigned int const blocks = (n + cpb - 1) / cpb;
             if (probe)
                 probe_mark(dev);
-            kern<<<blocks, 32 * warps, 0, dev.stream>>>(
-                    dev.chunks + s->c[b].first, dev.cols, src, dst, n);
+            if (n)
+                kern<<<(n + cpb - 1) / cpb, 32 * warps,
+                        2 * cpb * sizeof(uint64_t), dev.stream>>>(
+                        dev.chunks + s->c[b].first, dev.cols, src, dst, n);
+            if (nr && skern)
+                skern<<<(nr + 32 * warps - 1) / (32 * warps), 32 * warps, 0,
+                        dev.stream>>>(dev.rptr + s->r[b].first + b,
+                        dev.rcols + dev.rcol0[b], src,
+                        dev.segbuf + s->r[b].first * m->words, nr);
+            else if (nr)
+                rkern<<<(nr + 32 * warps - 1) / (32 * warps), 32 * warps, 0,
+                        dev.stream>>>(dev.recs + s->r[b].first, src, dst, nr);
+            CUDA_CHECK(cudaGetLastError());
+            if (probe)
+                probe_mark(dev);
+        }
+        bool recs = false;
+        for (unsigned int b = 0; s->rs && b < m->nbands; b++)
+            recs |= s->r[b].first < s->r[b].second;
+        if (recs) {
+            if (probe)
+                probe_mark(dev);
+            ckern<<<s->nblk, 1024, (size_t) R * m->words * sizeof(uint64_t),
+                    dev.stream>>>(s->rs, dev.rrow, dev.segbuf, dst,
+                    m->nbands, s->nblk, R, s->r0 - dev.row0,
+                    s->r1 - dev.row0);
             CUDA_CHECK(cudaGetLastError());
             if (probe)
                 probe_mark(dev);
@@ -2530,7 +3342,7 @@ void spmv_gf2_gather(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
     if (!asrc || !adst)
         copies.lock();
     if (m->calls > m->probe0 && m->calls <= m->probe1)
-        resplit_probed(m);
+        resplit_probed(m, asrc);
     double const t0 = now();
     spmv_dev & r = m->devs[0];
     uint64_t ** const vsrc = scratch(m, m->vsrc, asrc);
@@ -2540,6 +3352,8 @@ void spmv_gf2_gather(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
     bool const in_place = asrc && asrc->device == r.device;
     bool const rep = !sb.empty()
         && replicas_current(m, asrc, 0, nsrc * esz);
+    if (asrc && (sb.empty() || in_place || !rep))
+        stale_check(asrc, 0, nsrc * esz, "the gather source");
     if (!rep)
         replicas_release(m, asrc);
     const uint64_t * rsrc;
@@ -2574,11 +3388,28 @@ void spmv_gf2_gather(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
         spmv_dev & dev = m->devs[d];
         CUDA_CHECK(cudaSetDevice(dev.device));
         tl_mark(tlg, dev.stream, dev.device, "g free", m->calls);
-        launch_gather(m, dev, asrc, sb, d ? vsrc[d] : rsrc,
+        bool const span = env_split_wait()
+            && m->calls >= m->probe0 && m->calls < m->probe1;
+        if (span) {
+            for (cudaEvent_t & e : dev.span)
+                if (!e)
+                    CUDA_CHECK(cudaEventCreate(&e));
+            CUDA_CHECK(cudaEventRecord(dev.span[0], dev.stream));
+        }
+        std::vector<bwc_device_band> const wb = rep
+            ? src_writes(asrc, !d && in_place ? -1 : dev.device)
+            : std::vector<bwc_device_band>();
+        launch_gather(m, dev, asrc, sb, wb, d ? vsrc[d] : rsrc,
                 d ? vdst[d] : rdst, nsrc * esz,
                 !sb.empty() && !rep && !(!d && in_place),
                 segs_ordered(m, dev, want));
         CUDA_CHECK(cudaEventRecord(dev.ev, dev.stream));
+        if (span) {
+            CUDA_CHECK(cudaEventRecord(dev.span[1], dev.stream));
+            dev.spanned = true;
+        }
+        if (env_combine_ahead())
+            CUDA_CHECK(cudaEventRecord(product_ev(dev.device), dev.stream));
     }
     if (tl_on() && m->calls >= TL_K0 && m->calls < TL_K0 + TL_N)
         fprintf(stderr, "TH spmv host gather-enqueued %lu %.6f\n", m->calls, tl_now());
@@ -2595,6 +3426,9 @@ void spmv_gf2_gather(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
         arena_lock2 const lock(c, csrc);
         c->bands.resize(m->devs.size() + 1);
         bwc_dev_pieces & p = c->pieces;
+        static bool const pieces = env_pieces();
+        bool const out_only = pieces && p.out_only;
+        size_t stale_lo = SIZE_MAX, stale_hi = 0;
         size_t nbands = 0;
         int nout = 0;
         for (size_t d = 0; d < m->devs.size(); d++) {
@@ -2605,8 +3439,13 @@ void spmv_gf2_gather(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
             if (!e)
                 CUDA_CHECK(cudaEventCreateWithFlags(&e,
                             cudaEventDisableTiming));
-            if (part != mdst) {
+            if (part != mdst && out_only) {
+                stale_lo = std::min(stale_lo, (size_t) dev.row0 * esz);
+                stale_hi = std::max(stale_hi,
+                        (size_t) (dev.row0 + dev.nrows) * esz);
+            } else if (part != mdst) {
                 ready_wait(adst, dev.stream);
+                tl_mark(tlg, dev.stream, dev.device, "g fan0", m->calls);
                 CUDA_CHECK(cudaMemcpyPeerAsync(
                             mdst + (size_t) dev.row0 * m->words, adst->device,
                             part, dev.device, dev.nrows * esz, dev.stream));
@@ -2645,7 +3484,8 @@ void spmv_gf2_gather(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
         product_publish(adst, asrc, ndst * esz);
         adst->bands = c->bands.data();
         adst->nbands = (int) nbands;
-        static bool const pieces = env_pieces();
+        p.stale_lo = stale_lo < stale_hi ? stale_lo : 0;
+        p.stale_hi = stale_lo < stale_hi ? stale_hi : 0;
         p.nout = pieces ? nout : 0;
         p.out_settled = false;
         p.out_end = m->nrows * esz;
@@ -2699,6 +3539,8 @@ void spmv_gf2_scatter(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
     pieces_release(m, adst);
     replicas_release(m, asrc);
     std::vector<bwc_device_band> const sb = src_bands(asrc);
+    if (asrc)
+        stale_check(asrc, 0, nsrc * esz, "the scatter source");
     const uint64_t * rsrc = nullptr;
     if (asrc && sb.empty()) {
         rsrc = src_on_dev(m, asrc, src, nsrc * esz, vsrc[0]);
@@ -2776,6 +3618,7 @@ void spmv_gf2_scatter(spmv_gf2 * m, uint64_t * dst, const uint64_t * src,
             CUDA_CHECK(cudaMemcpyPeerAsync(mdst, adst->device, racc,
                         r.device, ndst * esz, c->stream));
         }
+        stale_clear(adst, 0, ndst * esz);
         product_publish(adst, asrc, ndst * esz);
         return;
     }
@@ -2804,13 +3647,14 @@ void spmv_gf2_free(spmv_gf2 * m)
                 CUDA_CHECK(cudaFree(kv.second[d]));
             }
     for (spmv_dev & dev : m->devs) {
+        free_dev(dev);
         CUDA_CHECK(cudaSetDevice(dev.device));
-        CUDA_CHECK(cudaFree(dev.rowptr));
-        CUDA_CHECK(cudaFree(dev.cols));
-        CUDA_CHECK(cudaFree(dev.chunks));
         if (dev.vtmp) CUDA_CHECK(cudaFree(dev.vtmp));
         for (cudaEvent_t e : dev.pe)
             CUDA_CHECK(cudaEventDestroy(e));
+        for (cudaEvent_t e : dev.span)
+            if (e)
+                CUDA_CHECK(cudaEventDestroy(e));
         CUDA_CHECK(cudaEventDestroy(dev.ev));
         CUDA_CHECK(cudaEventDestroy(dev.cev));
         CUDA_CHECK(cudaStreamDestroy(dev.stream));

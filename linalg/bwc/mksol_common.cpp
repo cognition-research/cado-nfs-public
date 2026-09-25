@@ -352,8 +352,11 @@ void mksol_combine(mksol_state & M, mmt_vec & y, unsigned int c)
     size_t const ybytes = M.As->vec_elt_stride(eblock);
     if (!M.dev_combine(y, c, mmt_my_own_offset_in_items(y), eblock)) {
         bwc_dev_fetch(yown, ybytes);
-        for(unsigned int i = 0 ; i < M.Av_multiplex ; i++)
-            M.AvxAs->addmul_tiny(yown, mmt_my_own_subvec(M.vi[i]), M.f(i, c), eblock);
+        for(unsigned int i = 0 ; i < M.Av_multiplex ; i++) {
+            arith_generic::elt const * vown = mmt_my_own_subvec(M.vi[i]);
+            bwc_dev_fetch(vown, M.Av->vec_elt_stride(eblock));
+            M.AvxAs->addmul_tiny(yown, vown, M.f(i, c), eblock);
+        }
         bwc_dev_push(yown, ybytes);
     }
     /* addmul_tiny degrades consistency ! */

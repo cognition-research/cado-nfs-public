@@ -1518,6 +1518,7 @@ struct bc_dev {
     unsigned int * delta, * done;    /* done: the step that found the generator, or UINT_MAX */
     int * lucky;
     unsigned int * nlog, * log;      /* the luck reports: 1 + b entries each */
+    uint64_t * A, * T;               /* b x m rows of the pivot search, null when in shared memory */
 };
 
 static bpoly bpoly_alloc(unsigned int rows, unsigned int wc, unsigned int ncoef)
@@ -1591,33 +1592,55 @@ __device__ uint64_t warp_xor(uint64_t v)
 template<typename T>
 __device__ void dswap(T & a, T & b) { T t = a; a = b; b = t; }
 
+/* bit i of v at bit 2i */
+__device__ uint64_t spread(uint64_t v)
+{
+    v = (v | v << 16) & 0x0000ffff0000ffffull;
+    v = (v | v << 8) & 0x00ff00ff00ff00ffull;
+    v = (v | v << 4) & 0x0f0f0f0f0f0f0f0full;
+    v = (v | v << 2) & 0x3333333333333333ull;
+    return (v | v << 1) & 0x5555555555555555ull;
+}
+
 /* The priority list of bpack_view::ple (PLE<T>::PLE): the rows sorted
  * by (delta, row), except that a position keeps its own row when the
  * sorted row there has the same delta, and the rows displaced that way
  * fill the remaining positions in sorted order. p2d is the list, d2p
- * its inverse, tmp a scratch of b entries. */
+ * its inverse, tmp a scratch of b entries; thread r holds the G rows
+ * G r .. G r + G - 1. */
+template <unsigned G>
 __device__ void ple_priority(const unsigned int * delta, unsigned int * p2d,
         unsigned int * d2p, unsigned int * tmp)
 {
-    unsigned int b = blockDim.x, r = threadIdx.x, w = delta[r], rank = 0;
-    for (unsigned int i = 0; i < b; i++) rank += delta[i] < w || (delta[i] == w && i < r);
-    tmp[rank] = r;
-    __syncthreads();
-    bool hole = delta[tmp[r]] != w;
-    d2p[r] = hole;
-    __syncthreads();
-    if (!hole) {
-        p2d[r] = r;
-    } else {
-        unsigned int k = 0, pos = 0;
-        for (unsigned int i = 0; i < b; i++)
-            k += d2p[i] && (delta[i] < w || (delta[i] == w && i < r));
-        for (unsigned int i = 0, c = 0; i < b; i++)
-            if (d2p[i] && c++ == k) pos = i;
-        p2d[pos] = r;
+    unsigned int b = blockDim.x * G, r0 = threadIdx.x * G, holes = 0;
+    for (unsigned int q = 0; q < G; q++) {
+        unsigned int r = r0 + q, w = delta[r], rank = 0;
+        for (unsigned int i = 0; i < b; i++) rank += delta[i] < w || (delta[i] == w && i < r);
+        tmp[rank] = r;
     }
     __syncthreads();
-    d2p[p2d[r]] = r;
+    for (unsigned int q = 0; q < G; q++) {
+        unsigned int r = r0 + q;
+        bool hole = delta[tmp[r]] != delta[r];
+        d2p[r] = hole;
+        holes |= (unsigned int) hole << q;
+    }
+    __syncthreads();
+    for (unsigned int q = 0; q < G; q++) {
+        unsigned int r = r0 + q, w = delta[r];
+        if (!(holes >> q & 1)) {
+            p2d[r] = r;
+        } else {
+            unsigned int k = 0, pos = 0;
+            for (unsigned int i = 0; i < b; i++)
+                k += d2p[i] && (delta[i] < w || (delta[i] == w && i < r));
+            for (unsigned int i = 0, c = 0; i < b; i++)
+                if (d2p[i] && c++ == k) pos = i;
+            p2d[pos] = r;
+        }
+    }
+    __syncthreads();
+    for (unsigned int q = 0; q < G; q++) d2p[p2d[r0 + q]] = r0 + q;
     __syncthreads();
 }
 
@@ -1630,9 +1653,12 @@ __device__ bool col_bit(const uint64_t * c, unsigned int col, unsigned int o)
 }
 
 /* The pivot search of step t: generator_found and binary_pivot_search
- * of lingen_qcode_binary, one block of b threads, thread r holding the
- * row at position r of E_t (A) and of the transform T that takes P E_t
- * to the upper factor, so that at the end A = Ut and T = LL. The same
+ * of lingen_qcode_binary, one block of b / G threads, thread r holding
+ * the G rows at positions G r .. G r + G - 1 of E_t (A) and of the
+ * transform T that takes P E_t to the upper factor, so that at the end
+ * A = Ut and T = LL. A block holds at most 1024 threads, so G is 2 for
+ * b above 1024. A and T are in shared memory, or in device memory (R)
+ * when they do not fit there next to the rest. The same
  * pivot order as bpack_view::ple gives word for word the CPU pi. A
  * step with zero rows in E_t logs t and lucky for the host report.
  *
@@ -1652,48 +1678,64 @@ __device__ bool col_bit(const uint64_t * c, unsigned int col, unsigned int o)
  * is kept without its diagonal (the identity at the current position,
  * which the swaps leave alone; a pivot added to a row brings its
  * diagonal bit along) and gets it back at the end. */
+template <unsigned G, bool R>
 __global__ void __launch_bounds__(1024) ple_kernel(bc_dev D, unsigned int t, unsigned int luck_mini)
 {
     extern __shared__ uint64_t sh[];
-    unsigned int b = blockDim.x, mb = D.E.wc, m = mb * 64, bw = b / 64, r = threadIdx.x, l = r % 32;
-    uint64_t * A = sh, * T = A + b * mb, * Minv = T + b * mb, * pv = Minv + 64;
+    unsigned int b = blockDim.x * G, mb = D.E.wc, m = mb * 64, bw = b / 64, r = threadIdx.x, l = r % 32;
+    uint64_t * A = R ? D.A : sh, * T = R ? D.T : A + b * mb, * Minv = R ? sh : T + b * mb, * pv = Minv + 64;
     uint64_t * C = pv + bw, * Lc = C + b;
     unsigned int * delta = (unsigned int *) (Lc + b), * lucky = delta + b;
     unsigned int * p2d = lucky + b, * d2p = p2d + b, * perm = d2p + b, * src = perm + b;
     unsigned int * red = src + b, * np = red + 32, * steps = np + 2;
     if (*D.done != UINT_MAX) return;
-    bool zero = true;
-    for (unsigned int w = 0; w < mb; w++) {
-        A[r * mb + w] = *D.E.at(t & 1, t, r, w);
-        T[r * mb + w] = 0;
-        zero &= A[r * mb + w] == 0;
+    unsigned int nzero = 0, nsure = 0;
+    for (unsigned int q = 0; q < G; q++) {
+        unsigned int ro = r * G + q;
+        bool zero = true;
+        for (unsigned int w = 0; w < mb; w++) {
+            A[ro * mb + w] = *D.E.at(t & 1, t, ro, w);
+            T[ro * mb + w] = 0;
+            zero &= A[ro * mb + w] == 0;
+        }
+        delta[ro] = D.delta[ro];
+        lucky[ro] = zero ? D.lucky[ro] + 1 : 0;
+        perm[ro] = ro;
+        D.lucky[ro] = lucky[ro];
+        nzero += zero;
+        nsure += zero && lucky[ro] >= luck_mini;
     }
-    delta[r] = D.delta[r];
-    lucky[r] = zero ? D.lucky[r] + 1 : 0;
-    perm[r] = r;
-    D.lucky[r] = lucky[r];
-    unsigned int newluck = block_sum(zero, red);
+    unsigned int newluck = block_sum(nzero, red);
     if (newluck) {
         unsigned int * rec = D.log + (size_t) *D.nlog * (1 + b);
-        unsigned int sure = block_sum(zero && lucky[r] >= luck_mini, red);
-        rec[1 + r] = lucky[r];
+        unsigned int sure = block_sum(nsure, red);
+        for (unsigned int q = 0; q < G; q++) rec[1 + r * G + q] = lucky[r * G + q];
         if (r == 0) *rec = t, ++*D.nlog;
         if (newluck == b - m && sure == b - m) {
             if (r == 0) *D.done = t;
             return;
         }
     }
-    ple_priority(delta, p2d, d2p, src);
+    ple_priority<G>(delta, p2d, d2p, src);
     if (r == 0) np[0] = 0;
     for (unsigned int pw = 0; pw < mb; pw++) {
         unsigned int np0 = np[0];
-        uint64_t aw = A[r * mb + pw];
-        for (unsigned int c = 0; c < 64; c++) {
-            unsigned int v = __ballot_sync(~0u, aw >> c & 1);
-            if (l == 0) ((unsigned int *) C)[(r / 64 * 64 + c) * 2 + r / 32 % 2] = v;
+        if (G == 1) {
+            uint64_t aw = A[r * mb + pw];
+            for (unsigned int c = 0; c < 64; c++) {
+                unsigned int v = __ballot_sync(~0u, aw >> c & 1);
+                if (l == 0) ((unsigned int *) C)[(r / 64 * 64 + c) * 2 + r / 32 % 2] = v;
+            }
+        } else {
+            /* the rows of warp k are the bits of word k of the columns */
+            uint64_t aw0 = A[2 * r * mb + pw], aw1 = A[(2 * r + 1) * mb + pw];
+            for (unsigned int c = 0; c < 64; c++) {
+                uint64_t v0 = spread(__ballot_sync(~0u, aw0 >> c & 1));
+                uint64_t v1 = spread(__ballot_sync(~0u, aw1 >> c & 1));
+                if (l == 0) C[r / 32 * 64 + c] = v0 | v1 << 1;
+            }
         }
-        Lc[r] = 0;
-        src[r] = r;
+        for (unsigned int q = 0; q < G; q++) Lc[r * G + q] = 0, src[r * G + q] = r * G + q;
         if (r < bw) pv[r] = np0 >= 64 * (r + 1) ? ~(uint64_t) 0 : np0 <= 64 * r ? 0 : ((uint64_t) 1 << np0 % 64) - 1;
         __syncthreads();
         if (r < 32) {
@@ -1764,55 +1806,79 @@ __global__ void __launch_bounds__(1024) ple_kernel(bc_dev D, unsigned int t, uns
             if (l == 0) np[1] = ii0;
         }
         __syncthreads();
-        unsigned int np1 = np[1], o = src[r];
-        uint64_t lp = 0, v = 0;
-        aw = 0;
-        for (unsigned int c = 0; c < 64; c++) {
-            lp |= (uint64_t) col_bit(Lc, c, o) << c;
-            aw |= (uint64_t) col_bit(C, c, o) << c;
+        unsigned int np1 = np[1], o[G];
+        uint64_t v[G], aw[G];
+        for (unsigned int q = 0; q < G; q++) {
+            uint64_t lp = 0;
+            o[q] = src[r * G + q];
+            aw[q] = 0;
+            v[q] = 0;
+            for (unsigned int c = 0; c < 64; c++) {
+                lp |= (uint64_t) col_bit(Lc, c, o[q]) << c;
+                aw[q] |= (uint64_t) col_bit(C, c, o[q]) << c;
+            }
+            for (unsigned int c = 0; c < np1 - np0; c++) if (lp >> c & 1) v[q] ^= Minv[c];
         }
-        for (unsigned int c = 0; c < np1 - np0; c++) if (lp >> c & 1) v ^= Minv[c];
-        /* four words of A and T at a time, to stay within the registers */
-        for (unsigned int w0 = 0; w0 < mb; w0 += 4) {
+        /* four words of A and T at a time over the G rows, to stay
+         * within the registers */
+        unsigned int ws = 4 / G;
+        for (unsigned int w0 = 0; w0 < mb; w0 += ws) {
             uint64_t a[4], tt[4];
+            for (unsigned int q = 0; q < G; q++) {
 #pragma unroll
-            for (unsigned int w = 0; w < 4; w++)
-                if (w0 + w < mb) a[w] = A[o * mb + w0 + w], tt[w] = T[o * mb + w0 + w];
-            for (uint64_t u = v; u; u &= u - 1) {
-                unsigned int c = np0 + __ffsll(u) - 1, oc = src[c];
+                for (unsigned int w = 0; w < ws; w++)
+                    if (w0 + w < mb) a[q * ws + w] = A[o[q] * mb + w0 + w], tt[q * ws + w] = T[o[q] * mb + w0 + w];
+                for (uint64_t u = v[q]; u; u &= u - 1) {
+                    unsigned int c = np0 + __ffsll(u) - 1, oc = src[c];
 #pragma unroll
-                for (unsigned int w = 0; w < 4; w++)
-                    if (w0 + w < mb) {
-                        a[w] ^= A[oc * mb + w0 + w];
-                        tt[w] ^= T[oc * mb + w0 + w] ^ (c / 64 == w0 + w ? (uint64_t) 1 << c % 64 : 0);
-                    }
+                    for (unsigned int w = 0; w < ws; w++)
+                        if (w0 + w < mb) {
+                            a[q * ws + w] ^= A[oc * mb + w0 + w];
+                            tt[q * ws + w] ^= T[oc * mb + w0 + w] ^ (c / 64 == w0 + w ? (uint64_t) 1 << c % 64 : 0);
+                        }
+                }
             }
             __syncthreads();
+            for (unsigned int q = 0; q < G; q++) {
+                unsigned int ro = r * G + q;
 #pragma unroll
-            for (unsigned int w = 0; w < 4; w++)
-                if (w0 + w < mb) A[r * mb + w0 + w] = w0 + w == pw ? aw : a[w], T[r * mb + w0 + w] = tt[w];
+                for (unsigned int w = 0; w < ws; w++)
+                    if (w0 + w < mb) A[ro * mb + w0 + w] = w0 + w == pw ? aw[q] : a[q * ws + w], T[ro * mb + w0 + w] = tt[q * ws + w];
+            }
             __syncthreads();
         }
         if (r == 0) np[0] = np1;
         __syncthreads();
     }
     unsigned int ii0 = np[0];
-    D.delta[r] = delta[r] + (r < ii0);
-    D.lucky[r] = lucky[r];
-    D.perm[r] = perm[r];
-    if (r < m) T[r * mb + r / 64] ^= (uint64_t) 1 << r % 64;
-    for (unsigned int w = 0; w < mb; w++) {
-        size_t i = ((size_t) (r / 64) * mb + w) * 64 + r % 64;
-        D.Ut[i] = A[r * mb + w];
-        D.LL[i] = T[r * mb + w];
+    for (unsigned int q = 0; q < G; q++) {
+        unsigned int ro = r * G + q;
+        D.delta[ro] = delta[ro] + (ro < ii0);
+        D.lucky[ro] = lucky[ro];
+        D.perm[ro] = perm[ro];
+        if (ro < m) T[ro * mb + ro / 64] ^= (uint64_t) 1 << ro % 64;
+        for (unsigned int w = 0; w < mb; w++) {
+            size_t i = ((size_t) (ro / 64) * mb + w) * 64 + ro % 64;
+            D.Ut[i] = A[ro * mb + w];
+            D.LL[i] = T[ro * mb + w];
+        }
     }
     if (r == 0) *D.np = ii0;
 }
 
-static size_t ple_shmem(unsigned int b, unsigned int mb)
+static size_t ple_shmem(unsigned int b, unsigned int mb, bool rows)
 {
-    return (2 * (size_t) b * mb + 64 + b / 64 + 2 * b) * sizeof(uint64_t)
+    return (rows * 2 * (size_t) b * mb + 64 + b / 64 + 2 * b) * sizeof(uint64_t)
         + (6 * b + 34 + b / 32) * sizeof(unsigned int);
+}
+
+template <unsigned G, bool R>
+static void ple_launch(const bc_dev & D, unsigned int t, unsigned int luck_mini, size_t shmem, bool first)
+{
+    if (first)
+        CUDA_CHECK(cudaFuncSetAttribute(ple_kernel<G, R>, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    ple_kernel<G, R><<<1, D.E.rows / G, shmem, stream()>>>(D, t, luck_mini);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 /* Y_k = S LL P X_k for the coefficients k0 <= k < k1 of X, into the
@@ -1824,7 +1890,8 @@ static size_t ple_shmem(unsigned int b, unsigned int mb)
  * rows. S moves the rows below np to coefficient k + 1 (dropped at the
  * end of X) and fills what it leaves: at k0 from U (the rows below np
  * of Y_{k0 - 1}; null when a previous launch wrote them), at k1 with
- * zeros. */
+ * zeros. Thread r holds the G rows G r .. G r + G - 1. */
+template <unsigned G>
 __global__ void bc_step_kernel(bc_dev D, bpoly X, int s, unsigned int k0, unsigned int k1,
         const uint64_t * U)
 {
@@ -1833,8 +1900,12 @@ __global__ void bc_step_kernel(bc_dev D, bpoly X, int s, unsigned int k0, unsign
     unsigned int k = k0 + blockIdx.x, w = blockIdx.y, r = threadIdx.x, np = *D.np;
     unsigned int m = D.E.wc * 64, mb = D.E.wc;
     uint64_t * TB = PX + m;
-    uint64_t x = *X.at(s, k, D.perm[r], w);
-    if (r < m) PX[r] = x;
+    uint64_t x[G];
+    for (unsigned int q = 0; q < G; q++) {
+        unsigned int ro = r * G + q;
+        x[q] = *X.at(s, k, D.perm[ro], w);
+        if (ro < m) PX[ro] = x[q];
+    }
     __syncthreads();
     for (unsigned int e = r; e < 4 * m; e += blockDim.x) {
         uint64_t v = 0;
@@ -1842,23 +1913,29 @@ __global__ void bc_step_kernel(bc_dev D, bpoly X, int s, unsigned int k0, unsign
         TB[e] = v;
     }
     __syncthreads();
-    uint64_t y = r < m ? 0 : x;
-    for (unsigned int cw = 0; cw < mb; cw++) {
-        uint64_t l = D.LL[((size_t) (r / 64) * mb + cw) * 64 + r % 64];
-        for (unsigned int q = 0; q < 16; q++) y ^= TB[(cw * 16 + q) * 16 + (l >> 4 * q & 15)];
+    for (unsigned int q = 0; q < G; q++) {
+        unsigned int ro = r * G + q;
+        uint64_t y = ro < m ? 0 : x[q];
+        for (unsigned int cw = 0; cw < mb; cw++) {
+            uint64_t l = D.LL[((size_t) (ro / 64) * mb + cw) * 64 + ro % 64];
+            for (unsigned int n = 0; n < 16; n++) y ^= TB[(cw * 16 + n) * 16 + (l >> 4 * n & 15)];
+        }
+        unsigned int kd = k + (ro < np);
+        if (kd < X.ncoef) *X.at(!s, kd, ro, w) = y;
+        if (k == k0 && ro < np && U) *X.at(!s, k, ro, w) = U[((size_t) (ro / 64) * X.wc + w) * 64 + ro % 64];
+        if (k + 1 == k1 && k1 < X.ncoef && ro >= np) *X.at(!s, k1, ro, w) = 0;
     }
-    unsigned int kd = k + (r < np);
-    if (kd < X.ncoef) *X.at(!s, kd, r, w) = y;
-    if (k == k0 && r < np && U) *X.at(!s, k, r, w) = U[((size_t) (r / 64) * X.wc + w) * 64 + r % 64];
-    if (k + 1 == k1 && k1 < X.ncoef && r >= np) *X.at(!s, k1, r, w) = 0;
 }
 
 static void bc_step(const bc_dev & D, bpoly X, int s, unsigned int k0, unsigned int k1,
         const uint64_t * U)
 {
     if (k0 >= k1) return;
-    bc_step_kernel<<<dim3(k1 - k0, X.wc), X.rows, D.E.wc * 64 * 5 * sizeof(uint64_t), stream()>>>(
-            D, X, s, k0, k1, U);
+    size_t smem = D.E.wc * 64 * 5 * sizeof(uint64_t);
+    if (X.rows <= 1024)
+        bc_step_kernel<1><<<dim3(k1 - k0, X.wc), X.rows, smem, stream()>>>(D, X, s, k0, k1, U);
+    else
+        bc_step_kernel<2><<<dim3(k1 - k0, X.wc), X.rows / 2, smem, stream()>>>(D, X, s, k0, k1, U);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1868,7 +1945,7 @@ static void bc_step(const bc_dev & D, bpoly X, int s, unsigned int k0, unsigned 
 polys glingen_basecase(glingen_bc * bc)
 {
     unsigned int m = bc->m, b = bc->b, L = bc->E.bits;
-    assert(m % 64 == 0 && b % 64 == 0 && b <= 1024 && bc->E.ld == b);
+    assert(m % 64 == 0 && b % 64 == 0 && b <= 2048 && bc->E.ld == b);
     use(0);
     unsigned int mb = m / 64, none = UINT_MAX, zero = 0;
     size_t bm = (size_t) b * mb;
@@ -1877,7 +1954,12 @@ polys glingen_basecase(glingen_bc * bc)
         dev_alloc<uint64_t>(bm), dev_alloc<uint64_t>(bm), dev_alloc<uint64_t>(bm),
         dev_alloc<unsigned int>(b), dev_alloc<unsigned int>(1),
         dev_upload(bc->delta, b), dev_upload(&none, 1), dev_upload(bc->lucky, b),
-        dev_upload(&zero, 1), dev_alloc<unsigned int>((size_t) L * (1 + b)) };
+        dev_upload(&zero, 1), dev_alloc<unsigned int>((size_t) L * (1 + b)), nullptr, nullptr };
+    int smax;
+    CUDA_CHECK(cudaDeviceGetAttribute(&smax, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    /* the rows go to device memory when they do not fit next to the rest */
+    if (ple_shmem(b, mb, true) > (size_t) smax)
+        D.A = dev_alloc<uint64_t>(bm), D.T = dev_alloc<uint64_t>(bm);
     CUDA_CHECK(cudaMemsetAsync(D.zero, 0, bm * sizeof(uint64_t), stream()));
     polys E = { dev_upload(bc->E.x, (size_t) m * b * bc->E.words), b, bc->E.words, L };
     to_polmat_kernel<<<blocks_for(D.E.coef_words() * L), 256, 0, stream()>>>(D.E, 0, E);
@@ -1886,12 +1968,23 @@ polys glingen_basecase(glingen_bc * bc)
     CUDA_CHECK(cudaFree(E.x));
     identity_kernel<<<blocks_for(b), 256, 0, stream()>>>(D.pi);
     CUDA_CHECK(cudaGetLastError());
-    size_t shmem = ple_shmem(b, mb);
-    CUDA_CHECK(cudaFuncSetAttribute(ple_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
+    unsigned int G = b <= 1024 ? 1 : 2;
+    bool R = D.A;
+    int sdef;
+    CUDA_CHECK(cudaDeviceGetAttribute(&sdef, cudaDevAttrMaxSharedMemoryPerBlock, 0));
+    if ((size_t) m * 5 * sizeof(uint64_t) > (size_t) sdef) {
+        if (G == 1)
+            CUDA_CHECK(cudaFuncSetAttribute(bc_step_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, m * 5 * sizeof(uint64_t)));
+        else
+            CUDA_CHECK(cudaFuncSetAttribute(bc_step_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, m * 5 * sizeof(uint64_t)));
+    }
+    size_t shmem = ple_shmem(b, mb, !R);
     for (unsigned int t = 0; t < L; t++) {
         int s = t & 1;
-        ple_kernel<<<1, b, shmem, stream()>>>(D, t, bc->luck_mini);
-        CUDA_CHECK(cudaGetLastError());
+        if (G == 1 && !R) ple_launch<1, false>(D, t, bc->luck_mini, shmem, t == 0);
+        if (G == 1 && R) ple_launch<1, true>(D, t, bc->luck_mini, shmem, t == 0);
+        if (G == 2 && !R) ple_launch<2, false>(D, t, bc->luck_mini, shmem, t == 0);
+        if (G == 2 && R) ple_launch<2, true>(D, t, bc->luck_mini, shmem, t == 0);
         bc_step(D, D.E, s, t + 1, L, D.Ut);
         bc_step(D, D.pi, s, 0, t + 2, D.zero);
     }
@@ -1914,7 +2007,8 @@ polys glingen_basecase(glingen_bc * bc)
     bpoly_free(D.E);
     bpoly_free(D.pi);
     for (void * p : { (void *) D.Ut, (void *) D.LL, (void *) D.zero, (void *) D.perm, (void *) D.np,
-            (void *) D.delta, (void *) D.done, (void *) D.lucky, (void *) D.nlog, (void *) D.log })
+            (void *) D.delta, (void *) D.done, (void *) D.lucky, (void *) D.nlog, (void *) D.log,
+            (void *) D.A, (void *) D.T })
         CUDA_CHECK(cudaFree(p));
     return pi;
 }

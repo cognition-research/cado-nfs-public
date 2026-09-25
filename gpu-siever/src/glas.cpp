@@ -166,6 +166,12 @@ params parse_args(int argc, char const ** argv)
     /* -host-mr feeds GLAS_FLT_HOST_MR the same way. */
     if (auto v = take("host-mr"))
         setenv("GLAS_FLT_HOST_MR", v->c_str(), 0);
+    /* -cofac-gpu 1 feeds GLAS_COFAC_GPU the same way (0 keeps the
+     * adaptive default); -ecm-curves feeds GLAS_ECM_CURVES. */
+    if (auto v = take("cofac-gpu"); v && atoi(v->c_str()) != 0)
+        setenv("GLAS_COFAC_GPU", "1", 0);
+    if (auto v = take("ecm-curves"))
+        setenv("GLAS_ECM_CURVES", v->c_str(), 0);
     for (int s = 0; s < 2; s++) {
         std::string const n = std::to_string(s);
         P.side[s].lim = strtoul(need(("lim" + n).c_str()).c_str(), nullptr, 10);
@@ -312,11 +318,7 @@ template <typename Fill>
 std::vector<fb_entry> parallel_fb(unsigned n_chunks, Fill && fill)
 {
     std::vector<std::vector<fb_entry>> part(n_chunks);
-    std::vector<std::thread> threads;
-    for (unsigned i = 0; i < n_chunks; i++)
-        threads.emplace_back([&, i] { fill(i, part[i]); });
-    for (auto & th : threads)
-        th.join();
+    run_threads(n_chunks, [&](unsigned i) { fill(i, part[i]); });
     size_t total = 0;
     for (auto const & p : part)
         total += p.size();
@@ -504,23 +506,45 @@ fb_cache_key fb_key(params const & P)
     return k;
 }
 
+bool pread_all(int fd, void * buf, size_t len, off_t off)
+{
+    while (len > 0) {
+        ssize_t const n = pread(fd, buf, len, off);
+        if (n <= 0)
+            return false;
+        buf = (char *)buf + n;
+        len -= n;
+        off += n;
+    }
+    return true;
+}
+
 /* Read the cache if it holds the key; false when the file is absent,
  * made for other inputs, or short (the process then parses and
- * rewrites it). */
+ * rewrites it). Thread t reads the part [n t / threads,
+ * n (t + 1) / threads) of each side's n entries. */
 bool read_fb_cache(std::string const & path, fb_cache_key const & key,
-                   std::vector<fb_entry> (&fb)[2])
+                   std::vector<fb_entry> (&fb)[2], unsigned threads)
 {
-    FILE * f = fopen(path.c_str(), "rb");
-    if (!f)
+    int const fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
         return false;
     fb_cache_header h;
-    bool ok = fread(&h, sizeof h, 1, f) == 1 && h.key == key;
-    for (int side = 0; ok && side < 2; side++) {
+    std::atomic<bool> ok = pread_all(fd, &h, sizeof h, 0) && h.key == key;
+    for (int side = 0; ok && side < 2; side++)
         fb[side].resize(h.count[side]);
-        ok = fread(fb[side].data(), sizeof(fb_entry), fb[side].size(), f) ==
-             fb[side].size();
-    }
-    fclose(f);
+    run_threads(ok ? threads : 0, [&](unsigned t) {
+        off_t base = sizeof h;
+        for (std::vector<fb_entry> & v : fb) {
+            size_t const lo = v.size() * t / threads;
+            size_t const hi = v.size() * (t + 1) / threads;
+            if (!pread_all(fd, v.data() + lo, (hi - lo) * sizeof(fb_entry),
+                           base + lo * sizeof(fb_entry)))
+                ok = false;
+            base += v.size() * sizeof(fb_entry);
+        }
+    });
+    close(fd);
     if (!ok)
         for (auto & v : fb)
             v.clear();
@@ -582,7 +606,7 @@ std::string write_fb_cache(std::string const & path, fb_cache_key const & key,
  * the files and the polynomial, and then write the cache. Returns the
  * log line for the relation file header. */
 std::string load_factor_bases(params const & P, cxx_cado_poly const & cpoly,
-                              std::vector<fb_entry> (&fb)[2])
+                              std::vector<fb_entry> (&fb)[2], unsigned threads)
 {
     char const * env = getenv("GLAS_FB_CACHE");
     bool const use_cache = !(env && strcmp(env, "0") == 0) &&
@@ -591,7 +615,7 @@ std::string load_factor_bases(params const & P, cxx_cado_poly const & cpoly,
     fb_cache_key key;
     if (use_cache) {
         key = fb_key(P);
-        if (read_fb_cache(cache_path, key, fb))
+        if (read_fb_cache(cache_path, key, fb, threads))
             return "# factor base cache: read " + cache_path + "\n";
     }
     for (int side = 0; side < 2; side++) {
@@ -1187,6 +1211,11 @@ std::vector<candidate> siever::pass1_cands(sq_task const & t,
         }
         if (b == 0)
             continue;
+        /* The q-lattice is the (a, b) with a == rho*b (mod q), so
+         * q | b implies q | gcd(a, b): not a valid relation even
+         * with gcd(i, j) == 1 (las gcd_coprime_with_q). */
+        if ((uint64_t)b % t.q == 0)
+            continue;
 
         proc_n[PN_COPRIME]++;
         std::vector<uint64_t> factors[2];
@@ -1376,8 +1405,15 @@ int main(int argc, char const ** argv)
     if (P.gpu)
         warmup = std::thread(gpu_warmup);
 
+    /* GLAS_STARTUP_PAR=0 reads the factor base cache and builds the
+     * device tables on one thread, after the context exists (the A/B
+     * control). */
+    bool const startup_par = env_flag("GLAS_STARTUP_PAR", true);
+    unsigned const startup_threads = startup_par ? P.nthreads : 1;
+
     /* factor bases */
-    std::string const fb_log = load_factor_bases(P, S.cpoly, S.fb);
+    std::string const fb_log =
+        load_factor_bases(P, S.cpoly, S.fb, startup_threads);
     for (int side = 0; side < 2; side++)
         fprintf(out, "# side-%d factor base: %zu entries\n", side,
                 S.fb[side].size());
@@ -1416,9 +1452,17 @@ int main(int argc, char const ** argv)
         assert(P.side[side].mfb <= 120);
     }
 
+    if (P.gpu && startup_par)
+        gpu_prepare(S.fb, logI, startup_threads);
+    double const t_join = wallclock();
     if (warmup.joinable())
         warmup.join();
-    if (P.gpu && !gpu_init(S.fb, logI, 1u << (P.logA - logI), S.tiny, S.flt))
+    if (P.gpu && getenv("GLAS_GPU_STATS"))
+        fprintf(stderr, "# GPU init context wait: %.2f s\n",
+                wallclock() - t_join);
+    if (P.gpu && !startup_par)
+        gpu_prepare(S.fb, logI, 1);
+    if (P.gpu && !gpu_init(logI, 1u << (P.logA - logI), S.tiny, S.flt))
         usage_error("-gpu requested but no CUDA device is available");
     double const t_gpu = wallclock();
 

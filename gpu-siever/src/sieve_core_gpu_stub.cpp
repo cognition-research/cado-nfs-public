@@ -9,8 +9,11 @@ void gpu_warmup()
 {
 }
 
-bool gpu_init(std::vector<fb_entry> const *, int, uint32_t,
-              tiny_table const &, filter_params const &)
+void gpu_prepare(std::vector<fb_entry> const *, int, unsigned)
+{
+}
+
+bool gpu_init(int, uint32_t, tiny_table const &, filter_params const &)
 {
     return false;
 }

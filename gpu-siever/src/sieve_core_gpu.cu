@@ -24,9 +24,11 @@
 #include "sieve_core.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cooperative_groups.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +37,7 @@
 #include <vector>
 
 #include <cub/cub.cuh>
+#include <cuda/atomic>
 #include <thrust/iterator/counting_iterator.h>
 #include <cuda_runtime.h>
 #include <gmp.h>
@@ -92,25 +95,6 @@ constexpr int BK_Q_SHIFT = 29;
 constexpr uint32_t BK_W_MASK = (1u << (BK_RESIEVE_SHIFT - BK_W_SHIFT)) - 1;
 static_assert(BK_Q_SHIFT + 32 <= 64);
 
-/* slot reservations one fill thread keeps in flight before the oldest
- * store must wait on its atomic result; 0 selects the classic scatter */
-#ifndef GLAS_FILL_PIPE
-#define GLAS_FILL_PIPE 0
-#endif
-constexpr int FILL_PIPE = GLAS_FILL_PIPE;
-
-/* Slots of the reservation queue kept in registers.  0 keeps the whole
- * queue in registers (one register pair per slot, which costs the
- * occupancy).  R > 0 keeps only the R newest atomic results in a
- * register ring and parks everything older, and all region offsets, in
- * a per-thread shared-memory queue of FILL_PIPE slots (6 bytes per slot
- * per thread); R must divide FILL_PIPE. */
-#ifndef GLAS_FILL_RING
-#define GLAS_FILL_RING 0
-#endif
-constexpr int FILL_RING = GLAS_FILL_RING;
-static_assert(FILL_RING == 0 ||
-              (FILL_PIPE % FILL_RING == 0 && (FILL_RING & (FILL_RING - 1)) == 0));
 constexpr int FILL_THREADS = 256;
 /* blocks per SM the fill kernel is compiled to fit (register cap
  * 65536 / (256 * N)); 0 leaves the register count to ptxas */
@@ -122,10 +106,8 @@ constexpr int FILL_THREADS = 256;
 #else
 #define FILL_BOUNDS
 #endif
-constexpr size_t FILL_SMEM =
-    FILL_RING > 0 ? (size_t)FILL_PIPE * FILL_THREADS * 6 : 0;
 /* GLAS_FILL_STAGE: threads per block of the exchange-staged fill */
-constexpr int FILL_STAGE_THREADS = 1024;
+constexpr int FILL_STAGE_THREADS = 256;
 
 /* Each region's bucket counter gets its own 128-byte L2 line.  The L2
  * serializes atomics that share a line, so packed counters queue each
@@ -165,16 +147,13 @@ struct gpu_task {
     double fijd[2][GLAS_MAX_DEGREE + 1];
     int32_t bound[2];
     int skip;   /* probe bits: 1 norms, 2 small walk, 4 bucket apply,
-                   8 bucket stores, 64 index-derived stores; bit 131072
-                   selects the padded lockstep fill */
+                   8 bucket stores, 64 index-derived stores */
 };
 
-constexpr int N_PHASES = 5;
-
-/* bit-131072 padded path: pad rows a warp takes per cursor fetch */
-constexpr uint32_t PAD_ROWQ = 8;
-/* bit-131072 padded path: a pad record names its writer lane here */
-constexpr int PAD_LANE_SHIFT = 28;
+enum { PH_TRANSFORM, PH_FILL, PH_REGION, PH_TINY, PH_RESIEVE, N_PHASES };
+/* stream events per chunk: the start, then one per phase boundary (the
+ * GLAS_FILL_GATE order has two fill and two region phases) */
+constexpr int N_EVENTS = 8;
 
 /* tiny primes and the norm coefficients mod each, from the tiny_table */
 constexpr uint32_t MAX_TINY = 64;
@@ -191,6 +170,33 @@ __constant__ uint32_t c_bucket_slab;
  * from register coefficients and share the next span's samples across the
  * warp; 0 selects the shared-memory coefficients and the lane-31 sample. */
 __constant__ uint32_t c_norm_reg;
+
+/* GLAS_NORM_STRIDE: the number of consecutive cells a lane owns in the
+ * norm phase of the register-coefficient path.  The warp evaluates the
+ * row polynomial at the first cell of each lane run and interpolates the
+ * log units across the rest.  The default 4 reproduces main; 8, 16 and
+ * 32 trade survivor accuracy for fewer evaluations and change the
+ * relation set. */
+__constant__ uint32_t c_norm_stride;
+
+/* GLAS_FILL_COPRIME: the fill also drops the hits where 3 divides both
+ * i and j (the hits where 2 divides both are always dropped). */
+__constant__ uint32_t c_fill_coprime;
+
+/* GLAS_FILL_GATE_SHIFT: the side-0 fill gate has one bit per
+ * 2^c_gate_shift positions; 0 is the survivor mask itself. */
+__constant__ uint32_t c_gate_shift;
+
+/* True when the hit at row j and offset off = i + I/2 can give a
+ * relation.  The survivor test removes the others anyway. */
+__device__ inline bool dev_fill_keeps(gpu_task const & t, uint32_t j,
+                                      uint32_t off)
+{
+    uint32_t const h = 1u << (t.logI - 1);
+    if (!((j | off) & 1))
+        return false;
+    return !c_fill_coprime || j % 3 || off % 3 != h % 3;
+}
 
 /* Index of slot b of the region's bucket.  The slab layout puts piece k
  * (64 entries) of every region into slab k, so the write fronts of all
@@ -225,20 +231,20 @@ struct gpu_slot {
     uint64_t * buckets[2];    /* [region][bucket_cap] packed hits */
     uint32_t * bucket_cnt[2]; /* [region * BK_CNT_STRIDE] */
     uint32_t * bitmask;       /* survivor bits, 1 bit per position */
+    uint32_t * cgate;         /* GLAS_FILL_GATE_SHIFT: folded mask */
     uint32_t * survivors[2];  /* [parity] */
     uint32_t * rs_idx[2];     /* small entries to resieve this task */
     uint32_t * rs_cnt;        /* [side] */
     uint64_t * tiny[2];       /* [parity][survivor][side] tiny masks */
     uint64_t * hits[2];       /* [parity] packed resieve hits */
-    uint32_t * counters[2];   /* [parity] survivor_cnt, hit_cnt, overflow */
+    uint64_t * hits_r[2];     /* GLAS_RHITS: [parity][region][slot] */
+    uint32_t * hit_rcnt[2];   /* GLAS_RHITS: [parity][region] lengths */
+    uint64_t * hits_ov[2];    /* GLAS_RHITS: [parity] overflow tail */
+    uint32_t * counters[2];   /* [parity] survivor_cnt, hit_cnt, overflow,
+                                 overflow-tail count */
     uint64_t * hits_sorted;   /* hits ordered by position, filter input */
     void * sort_temp;
     void * select_temp;       /* GLAS_FILL_CARRY: cub::DeviceSelect scratch */
-    uint64_t * pad[2];        /* bit 131072: [row][lane] padded records */
-    uint32_t * pad_curs;      /* [side] next free pad row */
-    uint32_t * pad_rowmap[2]; /* warp that wrote each pad row */
-    cudaStream_t pad_stream;  /* side-0 flush, overlaps the side-1 fill */
-    cudaEvent_t pad_ev[2];    /* side-0 fill done, side-0 flush done */
     uint32_t * fcnt;          /* filter output: kept survivors, host hits */
     cudaEvent_t fev[2];
     uint32_t * h_counters;
@@ -250,17 +256,22 @@ struct gpu_slot {
     uint32_t * h_ffac;        /* [fcand_cap][GPU_FAC_CAP] divided-out primes */
     uint64_t * h_flo;         /* [fcand_cap][side][2 limbs] leftover norms */
     uint32_t * h_bucket;      /* scratch for the bucket peak stat */
-    uint32_t * h_pad;         /* [parity][side] pad row demand */
     cudaEvent_t kdone[2];     /* [parity] chunk kernels done */
     cudaEvent_t odone[2];     /* [parity] chunk output copies done */
-    cudaEvent_t ev[2][N_PHASES + 1];
+    cudaEvent_t ev[2][N_EVENTS];
+    int ev_phase[2][N_EVENTS];  /* the phase that ends at each event */
+    int n_ev[2];
 };
 
 struct gpu_context {
     gpu_fb_entry * fb[2];
     gpu_small_entry * small[2];
+    std::vector<gpu_fb_entry> h_fb[2];        /* gpu_prepare builds, gpu_init uploads */
+    std::vector<gpu_small_entry> h_small[2];
     uint32_t n_fb[2];
     uint32_t n_band[2];       /* entries with q < fill_bands * I come first */
+    uint32_t n_owned[2];
+    uint32_t n_local[2];
     uint32_t n_small[2];      /* entries with q < I come before those */
     uint32_t n_dense[2];      /* entries with q < I/128 come before those */
     uint32_t n_skip[2];       /* leading entries with q < skip bound, not sieved */
@@ -272,12 +283,31 @@ struct gpu_context {
     uint32_t max_survivors;
     uint32_t max_hits;
     int n_slots;
-    uint32_t fill_bands = 8;  /* fill threads per entry in [n_small, n_band) */
+    uint32_t fill_bands = 2;  /* fill threads per entry in [n_small, n_band) */
     bool carry = false;       /* GLAS_FILL_CARRY */
     bool bucket_slab = true;  /* GLAS_BUCKET_SLAB=0 selects the plain layout */
     bool norm_reg = true;     /* GLAS_NORM_REG=0 selects the shared-memory path */
+    uint32_t norm_stride = 4; /* GLAS_NORM_STRIDE: cells per lane run */
+    bool fill_coprime = true; /* GLAS_FILL_COPRIME=0 keeps the 3 | gcd(i, j) hits */
+    bool fill_gate = true;    /* GLAS_FILL_GATE=0 fills side 0 ungated */
+    uint32_t gate_shift = 3;  /* GLAS_FILL_GATE_SHIFT=0 reads the survivor mask */
+    bool fill_tail0 = true;   /* GLAS_FILL_TAIL0=0 walks the side-0 tail in the row kernel */
+    bool region_cand = true;  /* GLAS_REGION_CAND=0 computes all side-0 cells */
     uint32_t carry_grid = 0;
     bool fill_stage = false;  /* GLAS_FILL_STAGE */
+    uint32_t fill_owners = 1;
+    uint32_t fill_pair_slots = 0;
+    bool fill_pair_fused = true;
+    uint32_t fill_row_bands = 0;
+    bool fill_row_group = true;
+    bool fill_row_fused = true;
+    uint32_t fill_row_window = 0;
+    int fill_row_window_side = -1;
+    bool fill_row_window_lean = false;
+    uint32_t fill_row_window_blocks = 2;
+    uint32_t fill_row_cluster = 1;
+    uint32_t fill_ahead = 0;
+    bool fill_owner_pairs = true;
     uint32_t fill_stage_grid = 0;
     uint32_t fill_stage_regions = 0;  /* regions with a slot in shared memory */
     gpu_slot slot[MAX_SLOTS];
@@ -288,6 +318,7 @@ struct gpu_context {
     bool pipeline = false;
     bool filter = false;
     bool assemble = false;    /* filter kernel also assembles candidates */
+    bool rhits = false;       /* resieve hits land in per-region lists */
     bool host_mr = false;     /* the host runs the deferred primality tests */
     uint32_t fcand_cap = 0;   /* fmeta/ffac/flo rows per slot */
     /* launch grids of the grid-striding kernels: one wave of resident
@@ -295,8 +326,6 @@ struct gpu_context {
     uint32_t filter_grid = 0, tiny_grid = 0, rs_grid = 0;
     size_t sort_temp_bytes = 0;
     size_t select_temp_bytes = 0;
-    uint64_t pad_rows_cap[2] = {};  /* bit 131072: pad rows per side */
-    uint32_t pad_grid = 0;          /* pad_flush_kernel launch blocks */
     double filter_ms = 0;
     double ecm_ms = 0;        /* cofactor batches, classify to last round */
     int skip = 0;
@@ -307,7 +336,6 @@ struct gpu_context {
     uint32_t bucket_max[2] = {};
     uint64_t bucket_sum[2] = {};   /* bucket entries over all chunks */
     FILE * bucket_dump = nullptr;  /* GLAS_BUCKET_DUMP: counts per chunk */
-    uint32_t pad_row_max[2] = {};  /* bit 131072: peak pad demand */
 };
 
 char const * const PHASE_NAMES[N_PHASES] = {"transform", "fill", "region",
@@ -733,7 +761,8 @@ __device__ void dev_proj_walk(gpu_task const & t, uint32_t q, uint32_t U,
         uint64_t const row = (j << t.logI) - xbeg;
         uint64_t const start = qq > 1 ? (t0 * n + I / 2) % qq : 0;
         for (uint64_t off = start; off < I; off += qq)
-            emit((uint32_t)(row + off));
+            if (dev_fill_keeps(t, (uint32_t)j, (uint32_t)off))
+                emit((uint32_t)(row + off));
     }
 }
 
@@ -752,10 +781,9 @@ __device__ uint64_t dev_affine_walk(gpu_task const & t, uint4 L, uint64_t x,
     uint64_t const inc_step = ((uint64_t)L.w << t.logI) + L.z;
     uint32_t const bound_warp = I - L.z;
     uint32_t const bound_step = L.x;
-    uint64_t const even_mask = ((uint64_t)1 << t.logI) | 1;
     uint32_t const maskI = I - 1;
     while (x < xend) {
-        if (x >= xbeg && (x & even_mask))
+        if (x >= xbeg && dev_fill_keeps(t, (uint32_t)(x >> t.logI), x & maskI))
             emit((uint32_t)(x - xbeg));
         uint32_t const i = x & maskI;
         uint64_t inc = 0;
@@ -770,164 +798,35 @@ __device__ uint64_t dev_affine_walk(gpu_task const & t, uint4 L, uint64_t x,
     return x;
 }
 
-/* FK walk of one affine entry with the slot reservations pipelined:
- * each hit's atomic result lands in its own queue slot and the store
- * reads it FILL_PIPE lattice steps later, so the walk overlaps the
- * atomic round trips.  Returns the cursor for the next chunk. */
-__device__ uint64_t dev_affine_walk_pipe(gpu_task const & t, uint4 L,
-                                         uint64_t x, uint64_t xend,
-                                         uint64_t packed,
-                                         uint32_t bucket_cap,
-                                         uint64_t * buckets,
-                                         uint32_t * bucket_cnt,
-                                         uint32_t * overflow)
+/* A non-null gate is the other side's survivor mask: a hit on a
+ * cleared bit cannot touch a survivor or a resieve hit, so the fill
+ * does not store it. */
+__device__ inline bool dev_gate_drops(uint32_t const * gate, uint32_t x)
 {
-    constexpr int P = FILL_PIPE > 0 ? FILL_PIPE : 1;
-    uint32_t const I = 1u << t.logI;
-    uint64_t const xbeg = (uint64_t)t.j0 << t.logI;
-    uint64_t const inc_warp = ((uint64_t)L.y << t.logI) - L.x;
-    uint64_t const inc_step = ((uint64_t)L.w << t.logI) + L.z;
-    uint32_t const bound_warp = I - L.z;
-    uint32_t const bound_step = L.x;
-    uint64_t const even_mask = ((uint64_t)1 << t.logI) | 1;
-    uint32_t const maskI = I - 1;
-    uint32_t qx[P], qs[P];
-    bool qv[P];
-#pragma unroll
-    for (int u = 0; u < P; u++)
-        qv[u] = false;
-    auto store = [&](int u) {
-        if (!qv[u])
-            return;
-        if (qs[u] >= bucket_cap) {
-            *overflow = 1;
-            return;
-        }
-        buckets[dev_bucket_idx(qx[u] >> SREG_LOG, qs[u], bucket_cap)] =
-            packed | (qx[u] & (SREG - 1));
-    };
-    bool run = x < xend;
-    while (run) {
-#pragma unroll
-        for (int u = 0; u < P; u++) {
-            store(u);
-            qv[u] = x >= xbeg && (x & even_mask);
-            qx[u] = (uint32_t)(x - xbeg);
-            if (qv[u])
-                qs[u] = atomicAdd(
-                    &bucket_cnt[(qx[u] >> SREG_LOG) * BK_CNT_STRIDE], 1);
-            uint32_t const i = x & maskI;
-            uint64_t inc = 0;
-            if (i >= bound_warp)
-                inc += inc_warp;
-            if (i < bound_step)
-                inc += inc_step;
-            x += inc;
-            if (inc == 0 || x >= xend) {
-                run = false;
-                break;
-            }
-        }
-    }
-#pragma unroll
-    for (int u = 0; u < P; u++)
-        store(u);
-    return x;
+    return gate &&
+           !(gate[x >> (5 + c_gate_shift)] >> (x >> c_gate_shift & 31) & 1);
 }
 
-/* The same pipelined walk with the queue in shared memory: qx_s/qs_s
- * are [FILL_PIPE][FILL_THREADS] arrays; a lattice step u of the depth-P
- * cycle writes its offset to qx_s[u] at issue (~0u when it is not a
- * hit), its atomic result lands in the register ring slot u % R and is
- * moved to qs_s[u] R steps later, and the bucket store reads both back
- * P steps after issue. */
-__device__ uint64_t dev_affine_walk_ring(gpu_task const & t, uint4 L,
-                                         uint64_t x, uint64_t xend,
-                                         uint64_t packed,
-                                         uint32_t bucket_cap,
-                                         uint64_t * buckets,
-                                         uint32_t * bucket_cnt,
-                                         uint32_t * overflow,
-                                         uint32_t * qx_s, uint16_t * qs_s)
+/* GLAS_FILL_GATE_SHIFT: bit b of gate word w is set when a survivor bit
+ * is set in the positions [(w << (5 + shift)) + (b << shift),
+ * + 2^shift).  The gate is a superset of the mask, so the fill stores
+ * more side-0 hits but the survivors and hits do not change. */
+__global__ void gate_fold_kernel(uint32_t const * mask, uint32_t * gate,
+                                 uint32_t shift, uint32_t words)
 {
-    constexpr int P = FILL_PIPE > 0 ? FILL_PIPE : 1;
-    constexpr int R = FILL_RING > 0 ? FILL_RING : 1;
-    uint32_t const I = 1u << t.logI;
-    uint64_t const xbeg = (uint64_t)t.j0 << t.logI;
-    uint64_t const inc_warp = ((uint64_t)L.y << t.logI) - L.x;
-    uint64_t const inc_step = ((uint64_t)L.w << t.logI) + L.z;
-    uint32_t const bound_warp = I - L.z;
-    uint32_t const bound_step = L.x;
-    uint64_t const even_mask = ((uint64_t)1 << t.logI) | 1;
-    uint32_t const maskI = I - 1;
-    constexpr uint32_t nth = FILL_THREADS;
-    uint32_t const tid = threadIdx.x;
-    uint32_t ring[R];
-#pragma unroll
-    for (int r = 0; r < R; r++)
-        ring[r] = 0;
-#pragma unroll
-    for (int u = 0; u < P; u++)
-        qx_s[u * nth + tid] = ~0u;
-    /* the 16-bit slot saturates so an overflowed reservation is still
-     * seen as >= bucket_cap by the flush */
-    auto park = [&](int slot, uint32_t v) {
-        qs_s[slot * nth + tid] = (uint16_t)min(v, 0xffffu);
-    };
-    auto flush = [&](int u) {
-        uint32_t const qx = qx_s[u * nth + tid];
-        if (qx == ~0u)
-            return;
-        uint32_t const qs = qs_s[u * nth + tid];
-        if (qs >= bucket_cap) {
-            *overflow = 1;
-            return;
-        }
-        buckets[dev_bucket_idx(qx >> SREG_LOG, qs, bucket_cap)] =
-            packed | (qx & (SREG - 1));
-    };
-    uint32_t h = 0;
-    bool run = x < xend;
-    while (run) {
-#pragma unroll
-        for (int u = 0; u < P; u++) {
-            /* park the result issued R steps ago (a slot the ring reuses
-             * now), then retire the step issued P steps ago */
-            park((u + P - R) % P, ring[u % R]);
-            flush(u);
-            bool const hit = x >= xbeg && (x & even_mask);
-            uint32_t const qx = (uint32_t)(x - xbeg);
-            qx_s[u * nth + tid] = hit ? qx : ~0u;
-            if (hit)
-                ring[u % R] = atomicAdd(
-                    &bucket_cnt[(qx >> SREG_LOG) * BK_CNT_STRIDE], 1);
-            h++;
-            uint32_t const i = x & maskI;
-            uint64_t inc = 0;
-            if (i >= bound_warp)
-                inc += inc_warp;
-            if (i < bound_step)
-                inc += inc_step;
-            x += inc;
-            if (inc == 0 || x >= xend) {
-                run = false;
-                break;
-            }
-        }
+    uint32_t const w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= words)
+        return;
+    uint32_t const span = 1u << shift;
+    uint32_t const per = 32 >> shift;   /* gate bits per mask word */
+    uint64_t const low = (1ull << span) - 1;
+    uint32_t g = 0;
+    for (uint32_t k = 0; k < span; k++) {
+        uint32_t const word = mask[((uint64_t)w << shift) + k];
+        for (uint32_t c = 0; c < per; c++)
+            g |= (uint32_t)((word >> (c << shift) & low) != 0) << (k * per + c);
     }
-    /* drain: the ring still holds the results of the last R steps (step
-     * s in ring[s % R], queue slot s % P); then retire every step still
-     * in the queue, the last P */
-    uint32_t const last = h - 1;
-#pragma unroll
-    for (int r = 0; r < R; r++) {
-        uint32_t const s = last - (last - r) % R;
-        if (s < h)
-            park(s % P, ring[r]);
-    }
-    for (uint32_t s = h > P ? h - P : 0; s < h; s++)
-        flush(s % P);
-    return x;
+    gate[w] = g;
 }
 
 /* First lattice point i = r*j (mod q) of the strip in the rows [jb, je),
@@ -1058,11 +957,47 @@ __device__ void dev_bucket_append(uint32_t region, uint64_t entry,
     buckets[dev_bucket_idx(region, slot, bucket_cap)] = entry;
 }
 
+/* GLAS_RHITS: a resieve hit goes to the hit list of its own region
+ * instead of the flat list the out stream sorts for the filter, which
+ * needs a survivor's hits grouped by position.  A hit does not outlive
+ * its chunk, so each region keeps a bounded list; a list that fills
+ * spills to the chunk's overflow tail, and a tail that fills sets the
+ * chunk's overflow flag and the host resieves the special-q on the
+ * CPU.  hit_cnt still counts every hit for the host's bound check, and
+ * hit_cnt + 2 (the fourth counter word) counts the tail. */
+constexpr uint32_t RHITS_CAP = 256;   /* hits kept in a region's list */
+constexpr uint32_t RHITS_OV = 1 << 16; /* overflow hits a chunk keeps */
+__device__ void dev_hit_emit(uint32_t x, uint64_t rec, uint32_t max_hits,
+                             uint64_t * hits, uint32_t * hit_cnt,
+                             uint64_t * hits_r, uint32_t * hit_rcnt,
+                             uint64_t * hits_ov)
+{
+    uint32_t const slot = atomicAdd(hit_cnt, 1);
+    if (slot >= max_hits)
+        return;
+    if (!hits_r) {
+        hits[slot] = rec;
+        return;
+    }
+    uint32_t const k = atomicAdd(hit_rcnt + (x >> SREG_LOG), 1);
+    if (k < RHITS_CAP) {
+        hits_r[(uint64_t)(x >> SREG_LOG) * RHITS_CAP + k] = rec;
+        return;
+    }
+    uint32_t const o = atomicAdd(hit_cnt + 2, 1);
+    if (o < RHITS_OV) {
+        hits_ov[o] = rec;
+        return;
+    }
+    hit_cnt[1] = 1;   /* the chunk's overflow flag */
+}
+
 /* Runs walk(emit) with the emit the probe bits in t.skip select: 8
  * walks without stores, 64 stores without the counter atomics; the
- * default appends packed | offset to the region's bucket. */
+ * default appends the gated packed | offset to the region's bucket. */
 template <typename W>
 __device__ void dev_fill_emit(gpu_task const & t, W walk, uint64_t packed,
+                              uint32_t const * gate,
                               uint32_t bucket_cap, uint64_t * buckets,
                               uint32_t * bucket_cnt, uint32_t * overflow)
 {
@@ -1085,6 +1020,8 @@ __device__ void dev_fill_emit(gpu_task const & t, W walk, uint64_t packed,
         return;
     }
     walk([&](uint32_t x) {
+        if (dev_gate_drops(gate, x))
+            return;
         dev_bucket_append(x >> SREG_LOG, packed | (x & (SREG - 1)),
                           bucket_cap, buckets, bucket_cnt, overflow);
     });
@@ -1101,97 +1038,13 @@ __global__ void FILL_BOUNDS fill_kernel(gpu_task t, gpu_fb_entry const * fb,
                             uint32_t const * roots, uint64_t * walk_x,
                             uint4 const * lattice, uint32_t bucket_cap,
                             uint64_t * buckets, uint32_t * bucket_cnt,
-                            uint32_t * overflow, uint64_t * pad,
-                            uint32_t * pad_rowmap, uint32_t * pad_cur,
-                            uint32_t pad_rows_cap)
+                            uint32_t * overflow, uint32_t const * gate)
 {
     uint32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t const nbt = (n_band - n_small) * nbands;
     bool const banded = tid < nbt;
     uint32_t const nb = banded ? nbands : 1;
     uint32_t const idx = banded ? n_small + tid / nb : n_band + tid - nbt;
-    if ((t.skip & (1 << 17)) && !(t.skip & 8)) {
-        /* one thread per entry; the init sets fill_bands = 1 for this
-         * path, so n_band == n_small and idx == n_small + tid */
-        uint64_t const xend = ((uint64_t)t.j0 << t.logI) + t.area;
-        /* Compacted write into chained row groups.  On each step the
-         * warp ballots the lanes that hold a record — one that packs
-         * the region key, the lane, the weight, and the position —
-         * and stores them contiguously at the group cursor, so
-         * sentinels fill only the unused tail of a group.  The warp
-         * takes PAD_ROWQ rows at a time from a shared cursor;
-         * pad_rowmap names the owner warp of each row and the record
-         * names the lane, so the flush can rebuild the entry index.
-         * Projective entries take the classic scatter path below. */
-        uint32_t const lane = threadIdx.x & 31;
-        uint32_t const gwarp = (idx - n_small) >> 5;
-        uint64_t const xw = idx < n ? walk_x[idx] : WALK_SKIP;
-        bool active = xw != WALK_PROJ && xw < xend;
-        bool const walker = active;
-        uint4 const L = active ? lattice[idx] : make_uint4(0, 0, 0, 0);
-        uint32_t const I = 1u << t.logI;
-        uint64_t const xbeg = (uint64_t)t.j0 << t.logI;
-        uint64_t const inc_warp = ((uint64_t)L.y << t.logI) - L.x;
-        uint64_t const inc_step = ((uint64_t)L.w << t.logI) + L.z;
-        uint32_t const bound_warp = I - L.z;
-        uint32_t const bound_step = L.x;
-        uint64_t const even = ((uint64_t)1 << t.logI) | 1;
-        uint32_t const maskI = I - 1;
-        uint64_t const wrec = active
-            ? ((uint64_t)fb[idx].weight << BK_W_SHIFT) &
-                  ((uint64_t)BK_W_MASK << BK_W_SHIFT)
-            : 0;
-        uint64_t x = xw;
-        constexpr uint32_t GW = PAD_ROWQ * 32;
-        uint64_t base = 0;
-        uint32_t fill = GW;
-        while (__any_sync(~0u, active)) {
-            uint64_t rec = ~0ull;
-            if (active && x >= xbeg && (x & even))
-                rec = (x - xbeg) >> SREG_LOG << 48 |
-                      (uint64_t)lane << PAD_LANE_SHIFT | wrec |
-                      (x & (SREG - 1));
-            uint32_t const mask = __ballot_sync(~0u, rec != ~0ull);
-            if (fill + __popc(mask) > GW) {
-                for (uint32_t w = fill + lane; w < GW; w += 32)
-                    pad[base + w] = ~0ull;
-                uint32_t row = 0;
-                if (lane == 0)
-                    row = atomicAdd(pad_cur, PAD_ROWQ);
-                row = __shfl_sync(~0u, row, 0);
-                if (row + PAD_ROWQ > pad_rows_cap) {
-                    *overflow = 1;
-                    for (; row < pad_rows_cap; row++)
-                        pad[(uint64_t)row * 32 + lane] = ~0ull;
-                    return;
-                }
-                if (lane < PAD_ROWQ)
-                    pad_rowmap[row + lane] = gwarp;
-                base = (uint64_t)row * 32;
-                fill = 0;
-            }
-            if (rec != ~0ull)
-                pad[base + fill + __popc(mask & ((1u << lane) - 1))] = rec;
-            fill += __popc(mask);
-            if (active) {
-                uint32_t const i = x & maskI;
-                uint64_t inc = 0;
-                if (i >= bound_warp)
-                    inc += inc_warp;
-                if (i < bound_step)
-                    inc += inc_step;
-                x += inc;
-                if (inc == 0 || x >= xend)
-                    active = false;
-            }
-        }
-        for (uint32_t w = fill + lane; w < GW; w += 32)
-            pad[base + w] = ~0ull;
-        if (walker)
-            walk_x[idx] = x;
-        if (xw != WALK_PROJ)
-            return;
-    }
     if (idx >= n)
         return;
     uint64_t const x0 = walk_x[idx];
@@ -1213,30 +1066,343 @@ __global__ void FILL_BOUNDS fill_kernel(gpu_task t, gpu_fb_entry const * fb,
         else
             walk_x[idx] = dev_affine_walk(t, lattice[idx], x0, xend, emit);
     };
-    if (FILL_PIPE > 0 && x0 != WALK_PROJ && !(t.skip & (8 | 64))) {
-        uint64_t const packed = dev_pack_entry(fb[idx]);
-        uint64_t const xs =
-            banded ? dev_band_start(t, fb[idx].q, roots[idx], jb, je) : x0;
-        uint64_t x1;
-        if (FILL_RING > 0) {
-            extern __shared__ uint32_t fill_smem[];
-            uint32_t * qx_s = fill_smem;
-            uint16_t * qs_s =
-                (uint16_t *)(fill_smem + (size_t)FILL_PIPE * FILL_THREADS);
-            x1 = dev_affine_walk_ring(t, lattice[idx], xs, xend, packed,
-                                      bucket_cap, buckets, bucket_cnt,
-                                      overflow, qx_s, qs_s);
-        } else {
-            x1 = dev_affine_walk_pipe(t, lattice[idx], xs, xend, packed,
-                                      bucket_cap, buckets, bucket_cnt,
-                                      overflow);
-        }
-        if (!banded)
-            walk_x[idx] = x1;
+    dev_fill_emit(t, walk, dev_pack_entry(fb[idx]), gate, bucket_cap, buckets,
+                  bucket_cnt, overflow);
+}
+
+/* With GATED (GLAS_FILL_TAIL0) the kernel walks the side-0 tail of one
+ * chunk and stores only the hits under the gate. */
+template <bool GATED>
+__global__ void FILL_BOUNDS
+fill_ahead_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t first,
+                  uint32_t n, uint32_t const * roots, uint64_t * walk_x,
+                  uint4 const * lattice, uint32_t regions, uint32_t cap,
+                  uint64_t * buckets, uint32_t * cnt, uint32_t * overflow,
+                  uint32_t const * gate)
+{
+    uint32_t const idx = first + blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n)
+        return;
+    uint64_t const x0 = walk_x[idx];
+    uint32_t const je = t.j0 + t.rows;
+    uint64_t const xend = (uint64_t)je << t.logI;
+    if (x0 == WALK_SKIP || x0 >= xend)
+        return;
+    uint64_t const packed = dev_pack_entry(fb[idx]);
+    auto emit = [&](uint32_t x) {
+        if constexpr (GATED)
+            if (dev_gate_drops(gate, x))
+                return;
+        uint32_t const region = x >> SREG_LOG;
+        uint32_t const bank = region & ~(regions - 1);
+        dev_bucket_append(region - bank, packed | (x & (SREG - 1)), cap,
+            buckets + (uint64_t)bank * cap, cnt + bank * BK_CNT_STRIDE,
+            overflow);
+    };
+    if (x0 == WALK_PROJ)
+        dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, t.j0, je, emit);
+    else
+        walk_x[idx] = dev_affine_walk(t, lattice[idx], x0, xend, emit);
+}
+
+__device__ void dev_bucket_append_pair(uint32_t region, uint64_t a, uint64_t b,
+                                       uint32_t cap, uint64_t * buckets,
+                                       uint32_t * cnt, uint32_t * overflow)
+{
+    uint32_t const slot = atomicAdd(&cnt[region * BK_CNT_STRIDE], 2);
+    if (slot >= cap || cap - slot < 2) {
+        *overflow = 1;
         return;
     }
-    dev_fill_emit(t, walk, dev_pack_entry(fb[idx]), bucket_cap, buckets,
-                  bucket_cnt, overflow);
+    if (slot & 1) {
+        buckets[dev_bucket_idx(region, slot, cap)] = a;
+        buckets[dev_bucket_idx(region, slot + 1, cap)] = b;
+    } else {
+        *(ulonglong2 *)(buckets + dev_bucket_idx(region, slot, cap)) =
+            make_ulonglong2(a, b);
+    }
+}
+
+template <int LOG_SLOTS>
+__global__ void __launch_bounds__(FILL_THREADS, 6)
+fill_local_pair_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
+                       uint32_t n_band, uint32_t nbands, uint32_t n,
+                       uint32_t n_local,
+                       uint32_t const * roots, uint64_t * walk_x,
+                       uint4 const * lattice, uint32_t cap, uint64_t * buckets,
+                       uint32_t * cnt, uint32_t * overflow,
+                       uint32_t const * gate)
+{
+    constexpr uint32_t SLOTS = 1u << LOG_SLOTS;
+    constexpr uint32_t OWNER_SHIFT = 31 - LOG_SLOTS;
+    constexpr uint32_t POS_MASK = (1u << OWNER_SHIFT) - 1;
+    constexpr uint32_t EMPTY = ~0u;
+    static_assert(LOG_SLOTS >= 10 && FILL_THREADS == 256);
+    __shared__ uint32_t pending[SLOTS];
+    __shared__ uint64_t packed[FILL_THREADS];
+    uint32_t const tid = blockIdx.x * FILL_THREADS + threadIdx.x;
+    uint32_t const nbt = (n_band - n_small) * nbands;
+    bool const banded = tid < nbt;
+    uint32_t const nb = banded ? nbands : 1;
+    uint32_t const idx = banded ? n_small + tid / nb : n_band + tid - nbt;
+    bool const cache_block = blockIdx.x * FILL_THREADS <
+        n_local - n_small + (n_band - n_small) * (nbands - 1);
+    if (cache_block) {
+        packed[threadIdx.x] = idx < n ? dev_pack_entry(fb[idx]) : 0;
+        for (uint32_t k = threadIdx.x; k < SLOTS; k += FILL_THREADS)
+            pending[k] = EMPTY;
+        __syncthreads();
+    }
+    auto position = [&](uint32_t held, uint32_t k) {
+        return (((held & POS_MASK) >> SREG_LOG) << (SREG_LOG + LOG_SLOTS)) |
+               (k << SREG_LOG) | (held & (SREG - 1));
+    };
+    auto emit = [&](uint32_t x) {
+        uint32_t const region = x >> SREG_LOG;
+        uint32_t const k = region & (SLOTS - 1);
+        uint32_t const token = (threadIdx.x << OWNER_SHIFT) |
+            ((x >> (SREG_LOG + LOG_SLOTS)) << SREG_LOG) | (x & (SREG - 1));
+        cuda::atomic_ref<uint32_t, cuda::thread_scope_block> cell(pending[k]);
+        uint32_t held = cell.load(cuda::memory_order_relaxed);
+        bool pair;
+        for (;;) {
+            pair = held != EMPTY &&
+                   ((held ^ token) & (POS_MASK & ~(SREG - 1))) == 0;
+            uint32_t const seen = atomicCAS(&pending[k], held, pair ? EMPTY : token);
+            if (seen == held)
+                break;
+            held = seen;
+        }
+        if (held == EMPTY)
+            return;
+        uint32_t const old_x = position(held, k);
+        uint64_t const old = packed[held >> OWNER_SHIFT] | (old_x & (SREG - 1));
+        if (pair)
+            dev_bucket_append_pair(region, old, packed[threadIdx.x] |
+                (x & (SREG - 1)), cap, buckets, cnt, overflow);
+        else
+            dev_bucket_append(old_x >> SREG_LOG, old, cap, buckets, cnt, overflow);
+    };
+    auto walk = [&](auto store) {
+        if (idx >= n)
+            return;
+        auto hit = [&](uint32_t x) {
+            if (dev_gate_drops(gate, x))
+                return;
+            store(x);
+        };
+        uint64_t const x0 = walk_x[idx];
+        uint32_t const band = tid % nb;
+        uint32_t const jb = t.j0 + band * t.rows / nb;
+        uint32_t const je = t.j0 + (band + 1) * t.rows / nb;
+        uint64_t const xend = (uint64_t)je << t.logI;
+        if (x0 != WALK_SKIP && x0 < xend) {
+            if (x0 == WALK_PROJ)
+                dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, jb, je, hit);
+            else if (banded)
+                dev_affine_walk(t, lattice[idx],
+                    dev_band_start(t, fb[idx].q, roots[idx], jb, je), xend, hit);
+            else
+                walk_x[idx] = dev_affine_walk(t, lattice[idx], x0, xend, hit);
+        }
+    };
+    if (idx < n_local) {
+        walk(emit);
+    } else {
+        uint64_t const entry = idx < n ? dev_pack_entry(fb[idx]) : 0;
+        walk([&](uint32_t x) {
+            dev_bucket_append(x >> SREG_LOG, entry | (x & (SREG - 1)),
+                              cap, buckets, cnt, overflow);
+        });
+    }
+    if (!cache_block)
+        return;
+    __syncthreads();
+    for (uint32_t k = threadIdx.x; k < SLOTS; k += FILL_THREADS) {
+        uint32_t const held = pending[k];
+        if (held != EMPTY) {
+            uint32_t const x = position(held, k);
+            dev_bucket_append(x >> SREG_LOG, packed[held >> OWNER_SHIFT] |
+                (x & (SREG - 1)), cap, buckets, cnt, overflow);
+        }
+    }
+}
+
+template <bool GROUP, uint32_t ROWS = 0, uint32_t C = 1, bool LEAN = false,
+          uint32_t BLOCKS = 2>
+__global__ void __launch_bounds__(FILL_THREADS, ROWS ? BLOCKS : 6)
+fill_row_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
+                uint32_t n, uint32_t n_all, uint32_t bands, uint32_t const * roots,
+                uint64_t * walk_x, uint4 const * lattice, uint32_t cap, uint64_t * buckets,
+                uint32_t * cnt, uint32_t * overflow, uint32_t const * gate)
+{
+    uint32_t const tid = blockIdx.x * FILL_THREADS + threadIdx.x;
+    constexpr uint32_t WIDTH = ROWS ? FILL_THREADS * C : 32;
+    uint32_t const row_threads =
+        (((n - n_small + WIDTH - 1) / WIDTH * WIDTH * bands + FILL_THREADS - 1) / FILL_THREADS) *
+        FILL_THREADS;
+    if (tid >= row_threads) {
+        uint32_t const idx = n + tid - row_threads;
+        if (idx >= n_all)
+            return;
+        uint64_t const x0 = walk_x[idx];
+        uint32_t const je = t.j0 + t.rows;
+        uint64_t const xend = (uint64_t)je << t.logI;
+        if (x0 == WALK_SKIP || x0 >= xend)
+            return;
+        uint64_t const packed = dev_pack_entry(fb[idx]);
+        auto hit = [&](uint32_t x) {
+            if (dev_gate_drops(gate, x))
+                return;
+            dev_bucket_append(x >> SREG_LOG, packed | (x & (SREG - 1)),
+                              cap, buckets, cnt, overflow);
+        };
+        if (x0 == WALK_PROJ)
+            dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, t.j0, je, hit);
+        else
+            walk_x[idx] = dev_affine_walk(t, lattice[idx], x0, xend, hit);
+        return;
+    }
+    uint32_t const lane = threadIdx.x & 31;
+    uint32_t const band = (tid / WIDTH) % bands;
+    uint32_t const idx = n_small + (tid / WIDTH / bands) * WIDTH + tid % WIDTH;
+    uint32_t const jb = t.j0 + band * t.rows / bands;
+    uint32_t const je = t.j0 + (band + 1) * t.rows / bands;
+    uint64_t const x0 = idx < n ? walk_x[idx] : WALK_SKIP;
+    bool const active = x0 != WALK_SKIP && x0 != WALK_PROJ;
+    uint32_t const q = active ? fb[idx].q : 1;
+    uint32_t const r = active ? roots[idx] : 0;
+    uint64_t const packed = active ? dev_pack_entry(fb[idx]) : 0;
+    uint32_t const I = 1u << t.logI;
+    uint32_t off = ((uint64_t)r * jb + I / 2) % q;
+    if constexpr (ROWS) {
+        static_assert(FILL_THREADS * ROWS < (1u << (32 - 17)));
+        auto const cluster = cooperative_groups::this_cluster();
+        auto sync = [&] {
+            if constexpr (C == 1) __syncthreads();
+            else cluster.sync();
+        };
+        auto map = [&](uint32_t * p, uint32_t rank) {
+            if constexpr (C == 1) return p;
+            else return cluster.map_shared_rank(p, rank);
+        };
+        uint32_t const rank = blockIdx.x % C;
+        uint32_t const regions = ROWS << max((int)t.logI - SREG_LOG, 0);
+        extern __shared__ uint32_t row_window_storage[];
+        uint32_t * used = row_window_storage, * base = used + regions;
+        for (uint32_t row = jb; row < je; row += ROWS) {
+            for (uint32_t k = threadIdx.x; k < regions; k += FILL_THREADS)
+                used[k] = 0;
+            __syncthreads();
+            uint32_t const first = ((row - t.j0) << t.logI) >> SREG_LOG;
+            uint32_t held[LEAN ? 1 : ROWS];
+            uint32_t hits = 0, o = off;
+            #pragma unroll
+            for (uint32_t k = 0; k < ROWS; k++) {
+                uint32_t const x = ((row + k - t.j0) << t.logI) + o;
+                bool const hit = active && row + k < je && o < I &&
+                                 dev_fill_keeps(t, row + k, o) &&
+                                 !dev_gate_drops(gate, x);
+                if constexpr (LEAN) {
+                    if (hit) {
+                        atomicAdd(used + ((x >> SREG_LOG) - first), 1);
+                        hits |= 1u << k;
+                    }
+                } else {
+                    held[k] = 0;
+                    if (hit) {
+                        uint32_t const ticket = atomicAdd(used + ((x >> SREG_LOG) - first), 1);
+                        held[k] = ((ticket + 1) << t.logI) | o;
+                    }
+                }
+                uint64_t const next = (uint64_t)o + r;
+                o = next >= q ? next - q : next;
+            }
+            if constexpr (!LEAN)
+                off = o;
+            sync();
+            for (uint32_t k = threadIdx.x * C + rank; k < regions; k += FILL_THREADS * C) {
+                uint32_t sizes[C], total = 0;
+                #pragma unroll
+                for (uint32_t c = 0; c < C; c++) {
+                    sizes[c] = map(used, c)[k];
+                    total += sizes[c];
+                }
+                uint32_t offset = total ? atomicAdd(cnt + (first + k) * BK_CNT_STRIDE, total) : 0;
+                #pragma unroll
+                for (uint32_t c = 0; c < C; c++) {
+                    map(base, c)[k] = offset;
+                    offset += sizes[c];
+                }
+            }
+            sync();
+            if constexpr (LEAN) {
+                #pragma unroll
+                for (uint32_t k = 0; k < ROWS; k++) {
+                    if (hits >> k & 1) {
+                        uint32_t const x = ((row + k - t.j0) << t.logI) + off;
+                        uint32_t const region = x >> SREG_LOG;
+                        uint32_t const slot = atomicAdd(base + (region - first), 1);
+                        if (slot < cap)
+                            buckets[dev_bucket_idx(region, slot, cap)] = packed | (x & (SREG - 1));
+                        else
+                            *overflow = 1;
+                    }
+                    uint64_t const next = (uint64_t)off + r;
+                    off = next >= q ? next - q : next;
+                }
+            } else {
+                #pragma unroll
+                for (uint32_t k = 0; k < ROWS; k++) {
+                    uint32_t const ticket = held[k] >> t.logI;
+                    if (ticket) {
+                        uint32_t const x = ((row + k - t.j0) << t.logI) + (held[k] & (I - 1));
+                        uint32_t const region = x >> SREG_LOG;
+                        uint32_t const slot = base[region - first] + ticket - 1;
+                        if (slot < cap)
+                            buckets[dev_bucket_idx(region, slot, cap)] = packed | (x & (SREG - 1));
+                        else
+                            *overflow = 1;
+                    }
+                }
+            }
+        }
+        sync();
+    } else for (uint32_t j = jb; j < je; j++) {
+        uint32_t const x = ((j - t.j0) << t.logI) + off;
+        bool const hit = active && off < I && dev_fill_keeps(t, j, off) &&
+                         !dev_gate_drops(gate, x);
+        uint32_t const mask = __ballot_sync(~0u, hit);
+        if (hit) {
+            uint32_t const region = x >> SREG_LOG;
+            uint64_t const entry = packed | (x & (SREG - 1));
+            if (GROUP) {
+                uint32_t const peers = __match_any_sync(mask, region);
+                uint32_t const leader = __ffs(peers) - 1;
+                uint32_t slot = 0;
+                if (lane == leader)
+                    slot = atomicAdd(&cnt[region * BK_CNT_STRIDE], __popc(peers));
+                slot = __shfl_sync(peers, slot, leader) +
+                       __popc(peers & ((1u << lane) - 1));
+                if (slot < cap)
+                    buckets[dev_bucket_idx(region, slot, cap)] = entry;
+                else
+                    *overflow = 1;
+            } else {
+                dev_bucket_append(region, entry, cap, buckets, cnt, overflow);
+            }
+        }
+        uint64_t const next = (uint64_t)off + r;
+        off = next >= q ? next - q : next;
+    }
+    if (idx < n && x0 == WALK_PROJ)
+        dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, jb, je,
+            [&](uint32_t x) {
+                if (dev_gate_drops(gate, x))
+                    return;
+                dev_bucket_append(x >> SREG_LOG, dev_pack_entry(fb[idx]) |
+                    (x & (SREG - 1)), cap, buckets, cnt, overflow);
+            });
 }
 
 /* GLAS_FILL_STAGE: the staged fill.  One resident block per SM keeps
@@ -1258,24 +1424,34 @@ fill_stage_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
                   uint32_t const * roots, uint64_t * walk_x,
                   uint4 const * lattice, uint32_t n_staged,
                   uint32_t bucket_cap, uint64_t * buckets,
-                  uint32_t * bucket_cnt, uint32_t * overflow)
+                  uint32_t * bucket_cnt, uint32_t * overflow,
+                  uint32_t owners, uint32_t const * gate)
 {
+    bool const owned = owners > 1;
+    uint32_t const unit = 1u << max((int)t.logI - SREG_LOG, 0);
+    uint32_t const units = t.nregions / unit;
+    uint32_t const rank = blockIdx.x % owners;
+    uint32_t const first = units * rank / owners * unit;
+    uint32_t const last = units * (rank + 1) / owners * unit;
     extern __shared__ unsigned long long slot[];   /* [n_staged] */
     for (uint32_t r = threadIdx.x; r < n_staged; r += FILL_STAGE_THREADS)
         slot[r] = 0;
     __syncthreads();
     auto hit = [&](uint32_t x, uint64_t packed) {
+        if (dev_gate_drops(gate, x))
+            return;
         uint32_t const region = x >> SREG_LOG;
+        uint32_t const local = region - first;
         uint64_t const entry = packed | (x & (SREG - 1));
-        if (region >= n_staged) {
+        if (local >= n_staged) {
             dev_bucket_append(region, entry, bucket_cap, buckets, bucket_cnt,
                               overflow);
             return;
         }
-        unsigned long long held = slot[region];
+        unsigned long long held = slot[local];
         for (;;) {
             unsigned long long const seen =
-                atomicCAS(&slot[region], held, held ? 0 : entry);
+                atomicCAS(&slot[local], held, held ? 0 : entry);
             if (seen == held)
                 break;
             held = seen;
@@ -1302,8 +1478,9 @@ fill_stage_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
     /* the loop is warp-uniform and the warp converges before each item,
      * so the item loads coalesce and the walks of one item run in one
      * warp pass as in fill_kernel */
-    for (uint32_t base = blockIdx.x * FILL_STAGE_THREADS + (threadIdx.x & ~31u);
-         base < n_item; base += gridDim.x * FILL_STAGE_THREADS) {
+    for (uint32_t base = blockIdx.x / owners * FILL_STAGE_THREADS +
+                             (threadIdx.x & ~31u);
+         base < n_item; base += gridDim.x / owners * FILL_STAGE_THREADS) {
         __syncwarp();
         uint32_t const tid = base + (threadIdx.x & 31);
         if (tid >= n_item)
@@ -1316,8 +1493,10 @@ fill_stage_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
         if (x0 == WALK_SKIP)
             continue;
         uint32_t const band = tid % nb;
-        uint32_t const jb = t.j0 + band * t.rows / nb;
-        uint32_t const je = t.j0 + (band + 1) * t.rows / nb;
+        uint32_t const jb = t.j0 + (owned ? (first << SREG_LOG) >> t.logI
+                                        : band * t.rows / nb);
+        uint32_t const je = t.j0 + (owned ? (last << SREG_LOG) >> t.logI
+                                        : (band + 1) * t.rows / nb);
         uint64_t const xend = (uint64_t)je << t.logI;
         if (x0 >= xend)
             continue;
@@ -1325,7 +1504,7 @@ fill_stage_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
         auto emit = [&](uint32_t x) { hit(x, packed); };
         if (x0 == WALK_PROJ)
             dev_proj_walk(t, fb[idx].q, roots[idx] - fb[idx].q, jb, je, emit);
-        else if (banded)
+        else if (banded || owned)
             dev_affine_walk(t, lattice[idx],
                             dev_band_start(t, fb[idx].q, roots[idx], jb, je),
                             xend, emit);
@@ -1335,7 +1514,7 @@ fill_stage_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
     __syncthreads();
     for (uint32_t r = threadIdx.x; r < n_staged; r += FILL_STAGE_THREADS)
         if (slot[r])
-            dev_bucket_append(r, slot[r], bucket_cap, buckets, bucket_cnt,
+            dev_bucket_append(first + r, slot[r], bucket_cap, buckets, bucket_cnt,
                               overflow);
 }
 
@@ -1379,43 +1558,8 @@ __global__ void fill_carry_kernel(gpu_task t, uint32_t chunk_log,
             }
             nextc[li] = (uint8_t)min(x >> chunk_log, (uint64_t)CARRY_DONE);
         };
-        dev_fill_emit(t, walk, dev_pack_entry(fb[idx]), bucket_cap, buckets,
-                      bucket_cnt, overflow);
-    }
-}
-
-/* bit-131072 flush: one streaming pass moves the padded records into
- * the classic buckets, so everything after the fill runs the classic
- * path.  A pad row names its owner warp through the rowmap, and the
- * record names the lane within the warp. */
-__global__ void pad_flush_kernel(uint64_t const * pad,
-                                 uint32_t const * rowmap,
-                                 uint32_t const * cur, uint32_t rows_cap,
-                                 gpu_fb_entry const * fb, uint32_t n_small,
-                                 uint32_t bucket_cap,
-                                 uint64_t * buckets, uint32_t * bucket_cnt,
-                                 uint32_t * overflow)
-{
-    uint64_t const end = (uint64_t)min(*cur, rows_cap) * 32;
-    uint64_t const step = (uint64_t)gridDim.x * blockDim.x;
-    for (uint64_t k = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-         k < end; k += step) {
-        uint64_t const h = pad[k];
-        if (h == ~0ull)
-            continue;
-        uint32_t const region = (uint32_t)(h >> 48);
-        uint32_t const slot =
-            atomicAdd(&bucket_cnt[region * BK_CNT_STRIDE], 1);
-        if (slot >= bucket_cap) {
-            *overflow = 1;
-            continue;
-        }
-        gpu_fb_entry const e =
-            fb[n_small + rowmap[k >> 5] * 32 + ((h >> PAD_LANE_SHIFT) & 31)];
-        buckets[dev_bucket_idx(region, slot, bucket_cap)] =
-            (uint64_t)e.q << BK_Q_SHIFT |
-            (uint64_t)e.resieve << BK_RESIEVE_SHIFT |
-            (h & (((uint64_t)1 << BK_RESIEVE_SHIFT) - 1));
+        dev_fill_emit(t, walk, dev_pack_entry(fb[idx]), nullptr, bucket_cap,
+                      buckets, bucket_cnt, overflow);
     }
 }
 
@@ -1455,6 +1599,10 @@ __device__ bool dev_pattern_entry(uint32_t q, uint32_t root)
     return q <= 16 && PAT_LEN % q == 0 && root < q;
 }
 
+/* With CAND (GLAS_REGION_CAND, side 0 only) the kernel computes the norm
+ * of a cell only at the positions the side-1 mask keeps.  The other cells
+ * hold undefined values, and no step reads them. */
+template <bool CAND>
 __global__ void __launch_bounds__(1024, 2)
 region_kernel(gpu_task t, gpu_small_entry const * small,
               uint32_t n_small, uint32_t n_dense, uint32_t n_skip,
@@ -1466,7 +1614,8 @@ region_kernel(gpu_task t, gpu_small_entry const * small,
               uint32_t * survivor_cnt,
               uint32_t obucket_cap, uint64_t const * obuckets,
               uint32_t const * obucket_cnt, uint32_t max_hits,
-              uint64_t * hits, uint32_t * hit_cnt)
+              uint64_t * hits, uint32_t * hit_cnt, uint64_t * hits_r,
+              uint32_t * hit_rcnt, uint64_t * hits_ov)
 {
     extern __shared__ __align__(8) uint32_t S[];   /* SREG 16-bit cells */
     uint32_t * const P = S + SREG / 2;   /* PAT_LEN 16-bit pattern cells */
@@ -1623,27 +1772,66 @@ region_kernel(gpu_task t, gpu_small_entry const * small,
          * next span (the position after the run at the last span), so the
          * warp evaluates the next span's samples before the current one
          * and lane 0 passes its next sample to lane 31 */
-        uint32_t off = 4 * lane;
-        float v0 = eval(off);
-        float u0 = dev_norm_logf(v0, e);
-        for (uint32_t s = 0; s < NS; s++, off += 128) {
-            float const vn = eval(off + 128);
-            float const un = dev_norm_logf(vn, e);
-            uint32_t const src = (lane + 1) & 31;
-            float const v1 = __shfl_sync(0xffffffffu, lane ? v0 : vn, src);
-            float const u1 = __shfl_sync(0xffffffffu, lane ? u0 : un, src);
-            uint32_t cell[4];
-            for (uint32_t r = 0; r < 4; r++) {
+        uint32_t const G = c_norm_stride;   /* cells per lane run */
+        float const invG = 1.0f / (float)G;
+        if (CAND) {
+            /* thread w owns mask word w.  Cell b of the word gets the
+             * value of the lane runs below; a cell outside the mask gets
+             * the cap.  The thread stores the shared words that hold a
+             * masked cell. */
+            uint32_t const mw = bitmask[(base >> 5) + threadIdx.x];
+            auto cell = [&](uint32_t b) {
+                if (!(mw >> b & 1))
+                    return BIAS + NORM_CAP;
+                uint32_t const x = 32 * lane + b;   /* offset in the run */
+                uint32_t const rr = x % G;
+                float const v0 = eval(x - rr);
+                float const v1 = eval(x - rr + G);
+                float const u0 = dev_norm_logf(v0, e);
                 float uu = u0;
-                if (r && (v0 < 0) != (v1 < 0))
-                    uu = dev_norm_logf(eval(off + r), e);
-                else if (r)
-                    uu = u0 + (u1 - u0) * (float)r * 0.25f;
-                cell[r] = BIAS + min((uint32_t)lrintf(uu), NORM_CAP);
+                if (rr && (v0 < 0) != (v1 < 0))
+                    uu = dev_norm_logf(eval(x), e);
+                else if (rr)
+                    uu = u0 + (dev_norm_logf(v1, e) - u0) * (float)rr * invG;
+                return BIAS + min((uint32_t)lrintf(uu), NORM_CAP);
+            };
+            uint32_t pairs = (mw | mw >> 1) & 0x55555555u;
+            while (pairs) {
+                uint32_t const b = __ffs(pairs) - 1;
+                pairs &= pairs - 1;
+                uint32_t const cw = (threadIdx.x * 32 + b) >> 1;
+                S[cw] = (cell(b) | cell(b + 1) << 16) -
+                        (use_pat ? P[cw % (PAT_LEN / 2)] : 0);
             }
-            store4(wp0 + off, cell[0] | cell[1] << 16, cell[2] | cell[3] << 16);
-            v0 = vn;
-            u0 = un;
+        } else {
+            uint32_t off = G * lane;
+            float v0 = eval(off);
+            float u0 = dev_norm_logf(v0, e);
+            for (; off < WP; off += 32 * G) {
+                float const vn = eval(off + 32 * G);
+                float const un = dev_norm_logf(vn, e);
+                uint32_t const src = (lane + 1) & 31;
+                float const v1 = __shfl_sync(0xffffffffu, lane ? v0 : vn, src);
+                float const u1 = __shfl_sync(0xffffffffu, lane ? u0 : un, src);
+                for (uint32_t w = 0; w < G; w += 4) {
+                    uint32_t cell[4];
+                    for (uint32_t r = 0; r < 4; r++) {
+                        uint32_t const rr = w + r;
+                        float uu = u0;
+                        if (rr && (v0 < 0) != (v1 < 0))
+                            uu = dev_norm_logf(eval(off + rr), e);
+                        else if (rr)
+                            /* at G = 4 this is the original r * 0.25f,
+                             * since 1.0f / G is exact for every stride */
+                            uu = u0 + (u1 - u0) * (float)rr * invG;
+                        cell[r] = BIAS + min((uint32_t)lrintf(uu), NORM_CAP);
+                    }
+                    store4(wp0 + off + w,
+                           cell[0] | cell[1] << 16, cell[2] | cell[3] << 16);
+                }
+                v0 = vn;
+                u0 = un;
+            }
         }
     }
     __syncthreads();
@@ -1749,27 +1937,30 @@ region_kernel(gpu_task t, gpu_small_entry const * small,
     uint32_t const row_mask = j == 0 ? 0 : j & 1 ? ~0u : 0xaaaaaaaau;
     uint16_t const * const cells = (uint16_t const *)S + wp0 + lane;
     uint32_t const wd = threadIdx.x;
-    uint32_t word = 0;
-    for (uint32_t b = 0; b < 32; b++) {
-        uint32_t const bal =
-            __ballot_sync(0xffffffffu, cells[b * 32] <= limit);
-        if (lane == b)
-            word = bal;
+    uint32_t word = CAND ? bitmask[(base >> 5) + wd] : 0;
+    if (!CAND) {
+        for (uint32_t b = 0; b < 32; b++) {
+            uint32_t const bal =
+                __ballot_sync(0xffffffffu, cells[b * 32] <= limit);
+            if (lane == b)
+                word = bal;
+        }
+        word &= row_mask;
+        uint32_t const widx = (base >> 5) + wd;
+        if (first) {
+            bitmask[widx] = word;
+            return;
+        }
+        word &= bitmask[widx];
     }
-    word &= row_mask;
-    uint32_t const widx = (base >> 5) + wd;
-    if (first) {
-        bitmask[widx] = word;
-        return;
-    }
-    word &= bitmask[widx];
     uint32_t keep = word;
     while (word) {
         int const b = __ffs(word) - 1;
         word &= word - 1;
         uint32_t const p = wd * 32 + b;
         int32_t const i = (int32_t)((base + p) & (I - 1)) - (int32_t)(I / 2);
-        if (dev_gcd(i < 0 ? (uint32_t)-i : (uint32_t)i, j) != 1) {
+        if ((CAND && ((uint16_t const *)S)[p] > limit) ||
+            dev_gcd(i < 0 ? (uint32_t)-i : (uint32_t)i, j) != 1) {
             keep &= ~(1u << b);
             continue;
         }
@@ -1799,10 +1990,12 @@ region_kernel(gpu_task t, gpu_small_entry const * small,
                 continue;
             if (!(h >> BK_RESIEVE_SHIFT & 1))
                 continue;
-            uint32_t const slot = atomicAdd(hit_cnt, 1);
-            if (slot < max_hits)
-                hits[slot] = (uint64_t)(base + p) << 32 |
-                             (h >> BK_Q_SHIFT) << 1 | (uint32_t)(hs ? side ^ 1 : side);
+            dev_hit_emit(base + p,
+                         (uint64_t)(base + p) << 32 |
+                             (h >> BK_Q_SHIFT) << 1 |
+                             (uint32_t)(hs ? side ^ 1 : side),
+                         max_hits, hits, hit_cnt, hits_r, hit_rcnt,
+                         hits_ov);
         }
     }
 }
@@ -1837,7 +2030,9 @@ __global__ void resieve_small_kernel(gpu_task t,
                                      uint32_t const * survivor_cnt,
                                      uint32_t max_survivors,
                                      uint32_t max_hits, uint64_t * hits,
-                                     uint32_t * hit_cnt)
+                                     uint32_t * hit_cnt, uint64_t * hits_r,
+                                     uint32_t * hit_rcnt,
+                                     uint64_t * hits_ov)
 {
     __shared__ uint32_t sx[RS_TILE];
     __shared__ uint32_t sj[RS_TILE];
@@ -1869,9 +2064,9 @@ __global__ void resieve_small_kernel(gpu_task t,
             uint32_t const q = small[e].q;
             uint64_t const M = small[e].magic;
             auto emit = [&](uint32_t x) {
-                uint32_t const slot = atomicAdd(hit_cnt, 1);
-                if (slot < max_hits)
-                    hits[slot] = (uint64_t)x << 32 | (uint64_t)q << 1 | side;
+                dev_hit_emit(x, (uint64_t)x << 32 | (uint64_t)q << 1 | side,
+                             max_hits, hits, hit_cnt, hits_r, hit_rcnt,
+                             hits_ov);
             };
             if (root < q) {
                 /* hit: xi = root * j + I/2 (mod q), tested as one
@@ -2488,6 +2683,10 @@ __device__ u128 dev_gcd128(u128 a, u128 b);
 __global__ void filter_kernel(gpu_task t, uint32_t const * survivors,
                               uint32_t n_surv, uint64_t const * tiny,
                               uint64_t const * hits, uint32_t n_hits,
+                              uint64_t const * hits_r,
+                              uint32_t const * hit_rcnt,
+                              uint64_t const * hits_ov,
+                              uint32_t const * ov_cnt,
                               uint32_t * out_surv, uint64_t * out_tiny,
                               uint32_t * out_cnt, uint32_t * out_meta,
                               uint32_t * out_fac, uint64_t * out_lo,
@@ -2507,11 +2706,45 @@ __global__ void filter_kernel(gpu_task t, uint32_t const * survivors,
         }
         if (b == 0)
             continue;
-        uint32_t const h0 = dev_hits_lower_bound(hits, n_hits,
-                                                 (uint64_t)x << 32);
-        uint32_t h1 = h0;
-        while (h1 < n_hits && (hits[h1] >> 32) == x)
-            h1++;
+        /* The q-lattice is the (a, b) with a == rho*b (mod q), so
+         * q | b implies q | gcd(a, b): not a valid relation even
+         * with gcd(i, j) == 1 (las gcd_coprime_with_q). */
+        if ((uint64_t)b % t.q == 0)
+            continue;
+        /* The survivor's hits.  With region hits they sit in the
+         * region's list, and in the shared tail when the list
+         * overflowed; without them, the out stream sorted the flat
+         * list by position and a binary search finds them. */
+        uint32_t h0 = 0, h1 = 0;
+        uint32_t const reg = x >> SREG_LOG;
+        uint32_t rcnt = 0, onov = 0;
+        if (hits_r) {
+            rcnt = hit_rcnt[reg];
+            if (rcnt > RHITS_CAP)
+                onov = min(*ov_cnt, RHITS_OV);
+        } else {
+            h0 = dev_hits_lower_bound(hits, n_hits, (uint64_t)x << 32);
+            h1 = h0;
+            while (h1 < n_hits && (hits[h1] >> 32) == x)
+                h1++;
+        }
+        auto each_hit = [&](auto f) {
+            if (hits_r) {
+                for (uint32_t k = 0, n = min(rcnt, RHITS_CAP); k < n; k++) {
+                    uint64_t const h = hits_r[(uint64_t)reg * RHITS_CAP + k];
+                    if (h >> 32 == x)
+                        f(h);
+                }
+                for (uint32_t k = 0; k < onov; k++) {
+                    uint64_t const h = hits_ov[k];
+                    if (h >> 32 == x)
+                        f(h);
+                }
+                return;
+            }
+            for (uint32_t h = h0; h < h1; h++)
+                f(hits[h]);
+        };
         uint64_t const ia = i < 0 ? (uint64_t)-i : (uint64_t)i;
         bool assemble = dev_gcd128(ia, (u128)(uint64_t)j) == 1;
         uint32_t lf[GPU_FAC_CAP];
@@ -2540,14 +2773,14 @@ __global__ void filter_kernel(gpu_task t, uint32_t const * survivors,
                 }
                 nl = wide_live(n);
             }
-            for (uint32_t h = h0; h < h1; h++) {
-                if ((hits[h] & 1) != (uint64_t)side)
-                    continue;
-                uint32_t const p = (uint32_t)hits[h] >> 1;
+            each_hit([&](uint64_t h) {
+                if ((h & 1) != (uint64_t)side)
+                    return;
+                uint32_t const p = (uint32_t)h >> 1;
                 if (side == t.sq_side && p == t.q)
-                    continue;
+                    return;
                 record(p, wide_divide_out_u32(n, nl, p));
-            }
+            });
             for (uint64_t m = tiny[2 * (uint64_t)idx + side]; m; m &= m - 1) {
                 uint32_t const p = c_tiny_p[__ffsll((long long)m) - 1];
                 record(p, wide_divide_out_u32(n, nl, p));
@@ -2575,9 +2808,14 @@ __global__ void filter_kernel(gpu_task t, uint32_t const * survivors,
                                             (nf - nf0) << 8 | nf0
                                       : 0;
         if (!assemble) {
-            uint32_t const hslot = atomicAdd(out_cnt + 1, h1 - h0);
-            for (uint32_t h = h0; h < h1; h++)
-                out_hits[hslot + h - h0] = hits[h];
+            uint32_t nh = h1 - h0;
+            if (hits_r) {
+                nh = 0;
+                each_hit([&](uint64_t) { nh++; });
+            }
+            uint32_t const hslot = atomicAdd(out_cnt + 1, nh);
+            uint32_t k = 0;
+            each_hit([&](uint64_t h) { out_hits[hslot + k++] = h; });
             continue;
         }
         uint32_t * const fac = out_fac + (uint64_t)slot * GPU_FAC_CAP;
@@ -3241,8 +3479,190 @@ void gpu_warmup()
     cudaFree(nullptr);
 }
 
-bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
-              tiny_table const & tt, filter_params const & fp)
+void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads)
+{
+    auto const t0 = std::chrono::steady_clock::now();
+    uint32_t const I = 1u << logI;
+    if (char const * e = getenv("GLAS_REGION_SKIP"))
+        ctx.skip = atoi(e);
+    if (char const * e = getenv("GLAS_FILL_BANDS"))
+        ctx.fill_bands = std::max(1, atoi(e));
+    ctx.carry = env_flag("GLAS_FILL_CARRY", false);
+    if (char const * e = getenv("GLAS_FILL_OWNERS"))
+        ctx.fill_owners = atoi(e);
+    assert(ctx.fill_owners >= 1 && ctx.fill_owners <= 16 &&
+           !(ctx.fill_owners & (ctx.fill_owners - 1)));
+    assert(ctx.fill_owners == 1 || !ctx.carry);
+    ctx.fill_owner_pairs = env_flag("GLAS_FILL_OWNER_PAIRS", true);
+    if (char const * e = getenv("GLAS_FILL_PAIR_SLOTS"))
+        ctx.fill_pair_slots = strtoul(e, nullptr, 10);
+    ctx.fill_pair_fused = env_flag("GLAS_FILL_PAIR_FUSED", true);
+    ctx.fill_stage = ctx.fill_owners > 1 || env_flag("GLAS_FILL_STAGE", false);
+    ctx.fill_row_bands = !ctx.fill_pair_slots && !ctx.fill_stage &&
+                        !ctx.carry && ctx.skip == 0 ? 32 : 0;
+    if (char const * e = getenv("GLAS_FILL_ROW_BANDS"))
+        ctx.fill_row_bands = strtoul(e, nullptr, 10);
+    ctx.fill_row_group = env_flag("GLAS_FILL_ROW_GROUP", true);
+    ctx.fill_row_fused = env_flag("GLAS_FILL_ROW_FUSED", true);
+    if (char const * e = getenv("GLAS_FILL_ROW_WINDOW"))
+        ctx.fill_row_window = strtoul(e, nullptr, 10);
+    if (char const * e = getenv("GLAS_FILL_ROW_WINDOW_SIDE"))
+        ctx.fill_row_window_side = atoi(e);
+    ctx.fill_row_window_lean = env_flag("GLAS_FILL_ROW_WINDOW_LEAN", false);
+    if (char const * e = getenv("GLAS_FILL_ROW_WINDOW_BLOCKS"))
+        ctx.fill_row_window_blocks = strtoul(e, nullptr, 10);
+    if (char const * e = getenv("GLAS_FILL_ROW_CLUSTER"))
+        ctx.fill_row_cluster = strtoul(e, nullptr, 10);
+    ctx.fill_ahead = ctx.fill_row_bands ? 1 : 0;
+    if (char const * e = getenv("GLAS_FILL_AHEAD"))
+        ctx.fill_ahead = strtoul(e, nullptr, 10);
+    assert(ctx.fill_ahead <= 2);
+    assert(ctx.fill_row_window_side >= -1 && ctx.fill_row_window_side <= 1);
+    assert(!ctx.fill_ahead || ctx.fill_row_bands);
+    assert(ctx.fill_row_window == 0 || ctx.fill_row_window == 8 ||
+           ctx.fill_row_window == 16 || ctx.fill_row_window == 32);
+    assert(ctx.fill_row_cluster == 1 || (ctx.fill_row_cluster == 2 && ctx.fill_row_window));
+    assert(ctx.fill_row_window_blocks == 2 || ctx.fill_row_window_blocks == 6);
+    assert((!ctx.fill_row_window_lean && ctx.fill_row_window_blocks == 2) ||
+           (ctx.fill_row_window == 8 && ctx.fill_row_cluster == 1));
+    assert(!ctx.fill_row_window || (ctx.fill_row_bands && ctx.fill_row_group));
+    assert(ctx.fill_pair_slots == 0 || ctx.fill_pair_slots == 1024 ||
+           ctx.fill_pair_slots == 4096);
+    bool const local_fill = ctx.fill_pair_slots || ctx.fill_row_bands;
+    assert(!(ctx.fill_pair_slots && ctx.fill_row_bands));
+    assert(!local_fill || (!ctx.fill_stage && !ctx.carry && ctx.skip == 0));
+    uint32_t local_bound = ctx.fill_row_bands ?
+        std::max(4u, ctx.fill_bands) * I : 1u << 22;
+    if (char const * e = getenv("GLAS_FILL_LOCAL_BOUND"))
+        local_bound = strtoul(e, nullptr, 10);
+    assert(!local_fill || local_bound >= ctx.fill_bands * I);
+    uint32_t owner_bound = 1u << 20;
+    if (char const * e = getenv("GLAS_FILL_OWNER_BOUND"))
+        owner_bound = strtoul(e, nullptr, 10);
+    assert(owner_bound > 0);
+    ctx.bucket_slab = env_flag("GLAS_BUCKET_SLAB", true);
+    ctx.norm_reg = env_flag("GLAS_NORM_REG", true);
+    ctx.fill_gate = env_flag("GLAS_FILL_GATE", true);
+    ctx.gate_shift = ctx.fill_gate ? 3 : 0;
+    if (char const * e = getenv("GLAS_FILL_GATE_SHIFT"))
+        ctx.gate_shift = strtoul(e, nullptr, 10);
+    assert(ctx.gate_shift <= 5 && (ctx.fill_gate || !ctx.gate_shift));
+    ctx.fill_tail0 = env_flag("GLAS_FILL_TAIL0",
+                              ctx.fill_gate && ctx.fill_row_bands);
+    assert(!ctx.fill_tail0 || (ctx.fill_gate && ctx.fill_row_bands));
+    bool const cand_ok = logI >= SREG_LOG && ctx.norm_reg &&
+                         ctx.skip == 0 && !ctx.fill_stage;
+    ctx.region_cand = env_flag("GLAS_REGION_CAND", cand_ok);
+    assert(!ctx.region_cand || cand_ok);
+    /* the lane run must be a multiple of the four cells one packed
+     * store covers, and must divide the warp run */
+    if (char const * e = getenv("GLAS_NORM_STRIDE"))
+        ctx.norm_stride = atoi(e);
+    if (ctx.norm_stride < 4 || ctx.norm_stride > 32 ||
+        (ctx.norm_stride & 3))
+        ctx.norm_stride = 4;
+    ctx.fill_coprime = env_flag("GLAS_FILL_COPRIME", true);
+    for (int side = 0; side < 2; side++) {
+        /* skip tier: entries with q below the bound are not sieved;
+         * the survivor bound rises by a multiple of their expected
+         * contribution instead.  The host tiny-prime division recovers
+         * their factors, so the bound must stay within the tiny-prime
+         * table (primes up to TINY_PRIME_BOUND). */
+        uint32_t skip_bound = 96;
+        if (char const * e = getenv("GLAS_SKIP_BOUND"))
+            skip_bound = std::min((uint32_t)atoi(e), TINY_PRIME_BOUND);
+        double comp_x = 1.0;
+        if (char const * e = getenv("GLAS_SKIP_COMP"))
+            comp_x = atof(e);
+
+        /* skip, dense, sparse small, banded, local, then large entries */
+        uint32_t const band_bound = ctx.fill_bands * I;
+        auto tier = [I, skip_bound, band_bound, local_fill, local_bound](fb_entry const & e) {
+            return e.q < skip_bound ? 0 : e.q < I / 128 ? 1 :
+                   e.q < I ? 2 : e.q < band_bound ? 3 :
+                   local_fill && e.q < local_bound ? 4 : 5;
+        };
+        /* thread t owns the range [lo(t), lo(t + 1)) of the factor base
+         * and its own slots in each tier, so each tier holds its entries
+         * in factor-base order.  The pass also sums the expected bucket
+         * load: one hit per position per 1/q density.  GLAS_GPU_STATS
+         * prints the measured peaks; overflow falls back to the CPU. */
+        size_t const n = fb[side].size();
+        auto lo = [n, threads](unsigned t) { return n * t / threads; };
+        std::vector<std::array<size_t, 6>> part(threads);
+        std::vector<double> part_dens(threads);
+        run_threads(threads, [&](unsigned t) {
+            for (size_t k = lo(t); k < lo(t + 1); k++) {
+                fb_entry const & e = fb[side][k];
+                part[t][tier(e)]++;
+                if (e.q >= I)
+                    part_dens[t] += 1.0 / e.q;
+            }
+        });
+        size_t cnt[6] = {};
+        std::vector<std::array<size_t, 6>> off(threads);
+        for (size_t i = 0, pos = 0; i < 6; i++)
+            for (unsigned t = 0; t < threads; t++) {
+                off[t][i] = pos;
+                pos += part[t][i];
+                cnt[i] += part[t][i];
+            }
+        std::vector<gpu_fb_entry> & h = ctx.h_fb[side];
+        h.resize(n);
+        run_threads(threads, [&](unsigned t) {
+            for (size_t k = lo(t); k < lo(t + 1); k++) {
+                fb_entry const & e = fb[side][k];
+                h[off[t][tier(e)]++] = {e.q, e.r, e.weight, e.resieve};
+            }
+        });
+        ctx.n_fb[side] = h.size();
+        ctx.n_skip[side] = cnt[0];
+        ctx.n_dense[side] = cnt[0] + cnt[1];
+        ctx.n_small[side] = cnt[0] + cnt[1] + cnt[2];
+        ctx.n_band[side] = cnt[0] + cnt[1] + cnt[2] + cnt[3];
+        ctx.n_owned[side] = ctx.n_small[side];
+        ctx.n_local[side] = local_fill ? ctx.n_band[side] + cnt[4] : ctx.n_small[side];
+        if (ctx.fill_owners > 1)
+            ctx.n_owned[side] = std::stable_partition(
+                h.begin() + ctx.n_band[side], h.end(),
+                [owner_bound](gpu_fb_entry const & e) {
+                    return e.q < owner_bound;
+                }) - h.begin();
+
+        /* dense tier: the pattern entries first, so the pattern build
+         * scans only them */
+        auto pat_q = [](gpu_fb_entry const & e) {
+            return e.q <= 16 && PAT_LEN % e.q == 0;
+        };
+        ctx.n_pat[side] = std::stable_partition(h.begin() + ctx.n_skip[side],
+                                                h.begin() + ctx.n_dense[side],
+                                                pat_q) - h.begin();
+
+        double comp = 0.0;
+        for (uint32_t k = 0; k < cnt[0]; k++)
+            comp += (double)h[k].weight / h[k].q;
+        ctx.skip_comp[side] = (int32_t)std::lround(comp_x * comp);
+
+        std::vector<gpu_small_entry> & m = ctx.h_small[side];
+        m.resize(ctx.n_small[side]);
+        for (uint32_t k = 0; k < ctx.n_small[side]; k++)
+            m[k] = {h[k].q, h[k].weight, UINT64_MAX / h[k].q};
+
+        double dens = 0.0;
+        for (double d : part_dens)
+            dens += d;
+        ctx.bucket_cap[side] = ((uint32_t)(SREG * dens * 1.25) & ~31u) + 512;
+        /* the slab layout fills whole 64-entry pieces */
+        if (ctx.bucket_slab)
+            ctx.bucket_cap[side] = (ctx.bucket_cap[side] + 63) & ~63u;
+    }
+    if (getenv("GLAS_GPU_STATS"))
+        fprintf(stderr, "# GPU init tables (%u threads): %.2f s\n", threads,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
+bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
+              filter_params const & fp)
 {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0)
@@ -3257,6 +3677,10 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
     }
     ctx.filter = env_flag("GLAS_GPU_FILTER", true);
     ctx.assemble = ctx.filter && env_flag("GLAS_GPU_ASSEMBLE", true);
+    /* region hits: the resieve emit files each hit under its region and
+     * the filter reads the survivor's own region list, so the out
+     * stream skips the radix sort of the flat hit list */
+    ctx.rhits = ctx.filter && env_flag("GLAS_RHITS", true);
     auto t_init = std::chrono::steady_clock::now();
     auto lap = [&](char const * what) {
         if (!ctx.stats)
@@ -3301,88 +3725,19 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
     }
 
     uint32_t const I = 1u << logI;
-    if (char const * e = getenv("GLAS_REGION_SKIP"))
-        ctx.skip = atoi(e);
-    if (char const * e = getenv("GLAS_FILL_BANDS"))
-        ctx.fill_bands = std::max(1, atoi(e));
-    ctx.carry = env_flag("GLAS_FILL_CARRY", false);
-    ctx.bucket_slab = env_flag("GLAS_BUCKET_SLAB", true);
-    ctx.norm_reg = env_flag("GLAS_NORM_REG", true);
-    /* the padded fill walks one thread per entry over the whole chunk */
-    if (ctx.skip & (1 << 17))
-        ctx.fill_bands = 1;
     for (int side = 0; side < 2; side++) {
-        /* skip tier: entries with q below the bound are not sieved;
-         * the survivor bound rises by a multiple of their expected
-         * contribution instead.  The host tiny-prime division recovers
-         * their factors, so the bound must stay within the tiny-prime
-         * table (primes up to TINY_PRIME_BOUND). */
-        uint32_t skip_bound = 16;
-        if (char const * e = getenv("GLAS_SKIP_BOUND"))
-            skip_bound = std::min((uint32_t)atoi(e), TINY_PRIME_BOUND);
-        double comp_x = 1.0;
-        if (char const * e = getenv("GLAS_SKIP_COMP"))
-            comp_x = atof(e);
-
-        /* skip, dense, sparse small, banded large, then large entries */
-        uint32_t const band_bound = ctx.fill_bands * I;
-        auto tier = [I, skip_bound, band_bound](fb_entry const & e) {
-            return e.q < skip_bound ? 0 : e.q < I / 128 ? 1 :
-                   e.q < I ? 2 : e.q < band_bound ? 3 : 4;
-        };
-        std::vector<gpu_fb_entry> h(fb[side].size());
-        size_t cnt[5] = {};
-        for (fb_entry const & e : fb[side])
-            cnt[tier(e)]++;
-        size_t off[5] = {0, cnt[0], cnt[0] + cnt[1],
-                         cnt[0] + cnt[1] + cnt[2],
-                         cnt[0] + cnt[1] + cnt[2] + cnt[3]};
-        for (fb_entry const & e : fb[side])
-            h[off[tier(e)]++] = {e.q, e.r, e.weight, e.resieve};
-        ctx.n_fb[side] = h.size();
-        ctx.n_skip[side] = cnt[0];
-        ctx.n_dense[side] = cnt[0] + cnt[1];
-        ctx.n_small[side] = cnt[0] + cnt[1] + cnt[2];
-        ctx.n_band[side] = cnt[0] + cnt[1] + cnt[2] + cnt[3];
-
-        /* dense tier: the pattern entries first, so the pattern build
-         * scans only them */
-        auto pat_q = [](gpu_fb_entry const & e) {
-            return e.q <= 16 && PAT_LEN % e.q == 0;
-        };
-        ctx.n_pat[side] = std::stable_partition(h.begin() + ctx.n_skip[side],
-                                                h.begin() + ctx.n_dense[side],
-                                                pat_q) - h.begin();
-
-        double comp = 0.0;
-        for (uint32_t k = 0; k < cnt[0]; k++)
-            comp += (double)h[k].weight / h[k].q;
-        ctx.skip_comp[side] = (int32_t)std::lround(comp_x * comp);
+        std::vector<gpu_fb_entry> const h = std::move(ctx.h_fb[side]);
         CUDA_CHECK(cudaMalloc(&ctx.fb[side], h.size() * sizeof(gpu_fb_entry)));
         CUDA_CHECK(cudaMemcpy(ctx.fb[side], h.data(),
                               h.size() * sizeof(gpu_fb_entry),
                               cudaMemcpyHostToDevice));
 
-        std::vector<gpu_small_entry> m(ctx.n_small[side]);
-        for (uint32_t k = 0; k < ctx.n_small[side]; k++)
-            m[k] = {h[k].q, h[k].weight, UINT64_MAX / h[k].q};
+        std::vector<gpu_small_entry> const m = std::move(ctx.h_small[side]);
         CUDA_CHECK(cudaMalloc(&ctx.small[side],
                               m.size() * sizeof(gpu_small_entry)));
         CUDA_CHECK(cudaMemcpy(ctx.small[side], m.data(),
                               m.size() * sizeof(gpu_small_entry),
                               cudaMemcpyHostToDevice));
-
-        /* expected bucket load: one hit per position per 1/q density.
-         * GLAS_GPU_STATS prints the measured peaks; overflow falls
-         * back to the CPU. */
-        double dens = 0.0;
-        for (fb_entry const & e : fb[side])
-            if (e.q >= I)
-                dens += 1.0 / e.q;
-        ctx.bucket_cap[side] = ((uint32_t)(SREG * dens * 1.25) & ~31u) + 512;
-        /* the slab layout fills whole 64-entry pieces */
-        if (ctx.bucket_slab)
-            ctx.bucket_cap[side] = (ctx.bucket_cap[side] + 63) & ~63u;
     }
     for (int side = 0; ctx.carry && side < 2; side++) {
         size_t bytes = 0;
@@ -3404,7 +3759,7 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
      * processes survivors. */
     auto slot_bytes = [](uint64_t area) {
         uint64_t b = area / 8 + 2 * (area / 64 * (4 + 16) + area / 8 * 8);
-        if (ctx.filter) {
+        if (ctx.filter && !ctx.rhits) {
             b += area / 8 * 8;
             size_t st = 0;
             cub::DeviceRadixSort::SortKeys(nullptr, st,
@@ -3412,7 +3767,14 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
                                            (uint64_t *)nullptr, area / 8);
             b += st;
         }
+        if (ctx.rhits)
+            /* a region's hit list and count, plus the overflow tail,
+             * per parity */
+            b += 2 * ((area >> SREG_LOG) * (RHITS_CAP * 8 + 4) +
+                      RHITS_OV * 8);
         b += ctx.select_temp_bytes;
+        if (ctx.gate_shift)
+            b += area / 8 >> ctx.gate_shift;
         for (int side = 0; side < 2; side++) {
             /* roots for all entries; walk_x + lattice for the walked
              * entries; carry record, next-chunk byte and active-list
@@ -3421,7 +3783,7 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
             uint64_t const n_walk = ctx.carry ? ctx.n_band[side] : ctx.n_fb[side];
             b += (uint64_t)ctx.n_fb[side] * 4 + n_walk * 24 +
                  (ctx.carry ? n_large * (sizeof(carry_state) + 5) : 0) +
-                 (area >> SREG_LOG) *
+                 (area >> SREG_LOG) * (side == 1 && ctx.fill_ahead ? ctx.fill_ahead : 1) *
                      (ctx.bucket_cap[side] * 8 + BK_CNT_STRIDE * 4);
         }
         return b;
@@ -3443,9 +3805,7 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
      * the slot count then follows from the memory budget. */
     if (char const * e = getenv("GLAS_GPU_CHUNK"))
         chunk = std::clamp((uint64_t)1 << atoi(e), chunk_min, chunk_max);
-    /* the pad record's 16-bit region key reserves 0xffff for the
-     * sentinel, so the chunk stays below 2^16 regions */
-    if (ctx.skip & (1 << 17))
+    if (ctx.fill_ahead > 1)
         chunk = std::min(chunk, (uint64_t)1 << 30);
     ctx.chunk_area = chunk;
     ctx.max_regions = chunk >> SREG_LOG;
@@ -3453,14 +3813,20 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
     CUDA_CHECK(cudaMemcpyToSymbol(c_bucket_slab, &slab, 4));
     uint32_t const norm_reg = ctx.norm_reg;
     CUDA_CHECK(cudaMemcpyToSymbol(c_norm_reg, &norm_reg, 4));
+    CUDA_CHECK(
+        cudaMemcpyToSymbol(c_norm_stride, &ctx.norm_stride, 4));
+    uint32_t const fill_coprime = ctx.fill_coprime;
+    CUDA_CHECK(cudaMemcpyToSymbol(c_fill_coprime, &fill_coprime, 4));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_gate_shift, &ctx.gate_shift, 4));
     ctx.max_survivors = chunk / 64;
     ctx.max_hits = chunk / 8;
     if (ctx.assemble)
         ctx.fcand_cap = std::min(ctx.max_survivors, FCAND_MAX);
     if (ctx.filter) {
-        CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
-            nullptr, ctx.sort_temp_bytes, (uint64_t const *)nullptr,
-            (uint64_t *)nullptr, ctx.max_hits));
+        if (!ctx.rhits)
+            CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
+                nullptr, ctx.sort_temp_bytes, (uint64_t const *)nullptr,
+                (uint64_t *)nullptr, ctx.max_hits));
         int uva = 0;
         /* the filter kernel writes through the host pointers of the
          * mapped pinned buffers, which needs unified addressing */
@@ -3477,10 +3843,9 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
         ctx.carry_grid = full_grid(fill_carry_kernel, 256, 0);
         assert(total_area / chunk < CARRY_DONE);
     }
-    ctx.fill_stage = env_flag("GLAS_FILL_STAGE", false);
     if (ctx.fill_stage) {
-        /* the fill probes and the padded fill are fill_kernel paths */
-        assert(!(ctx.skip & (8 | 64 | 1 << 17)));
+        /* the fill probes are fill_kernel paths */
+        assert(!(ctx.skip & (8 | 64)));
         /* the 16-byte pair store needs buckets that start 16-byte aligned */
         assert(ctx.bucket_cap[0] % 2 == 0 && ctx.bucket_cap[1] % 2 == 0);
         /* the slot table leaves room for one region block on the SM */
@@ -3489,8 +3854,11 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
             &smem, cudaDevAttrMaxSharedMemoryPerMultiprocessor, 0));
         CUDA_CHECK(cudaDeviceGetAttribute(
             &reserved, cudaDevAttrReservedSharedMemoryPerBlock, 0));
+        uint32_t const unit = 1u << std::max(logI - SREG_LOG, 0);
+        uint32_t const owner_regions =
+            (ctx.max_regions / unit + ctx.fill_owners - 1) / ctx.fill_owners * unit;
         ctx.fill_stage_regions = std::min<uint32_t>(
-            ctx.max_regions, (smem - REGION_SMEM - 2 * reserved) / 8);
+            owner_regions, (smem - REGION_SMEM - 2 * reserved) / 8);
         size_t const bytes = (size_t)ctx.fill_stage_regions * 8;
         CUDA_CHECK(cudaFuncSetAttribute(
             fill_stage_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -3501,10 +3869,12 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
             fill_stage_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
             cudaSharedmemCarveoutMaxShared));
         CUDA_CHECK(cudaFuncSetAttribute(
-            region_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+            region_kernel<0>, cudaFuncAttributePreferredSharedMemoryCarveout,
             cudaSharedmemCarveoutMaxShared));
         ctx.fill_stage_grid =
             full_grid(fill_stage_kernel, FILL_STAGE_THREADS, bytes);
+        ctx.fill_stage_grid =
+            ctx.fill_stage_grid / ctx.fill_owners * ctx.fill_owners;
         assert(ctx.fill_stage_grid > 0);
     }
 
@@ -3512,30 +3882,6 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
                                           budget / slot_bytes(chunk));
     if (char const * e = getenv("GLAS_GPU_SLOTS"))
         ctx.n_slots = std::min(ctx.n_slots, atoi(e));
-    if (ctx.skip & (1 << 17)) {
-        for (int side = 0; side < 2; side++) {
-            uint32_t const nwarps =
-                (ctx.n_fb[side] - ctx.n_small[side] + 31) / 32;
-            /* the classic bucket capacity in pad slots, plus one row
-             * group per warp for the cursor quantization */
-            ctx.pad_rows_cap[side] =
-                (uint64_t)ctx.max_regions * ctx.bucket_cap[side] / 32 +
-                (uint64_t)nwarps * PAD_ROWQ;
-        }
-        /* the pad arrays are not in slot_bytes; shrink the slot count */
-        uint64_t pb = 0;
-        for (int side = 0; side < 2; side++)
-            pb += ctx.pad_rows_cap[side] * (256 + 4);
-        ctx.n_slots = (int)std::min<uint64_t>(
-            ctx.n_slots, budget / (slot_bytes(chunk) + pb));
-        int sm = 0, per_sm = 0;
-        CUDA_CHECK(cudaDeviceGetAttribute(&sm,
-                                          cudaDevAttrMultiProcessorCount,
-                                          0));
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, pad_flush_kernel, 256, 0));
-        ctx.pad_grid = sm * per_sm;
-    }
     if (char const * e = getenv("GLAS_XFORM_REPEAT"))
         ctx.xform_repeat = std::max(1, atoi(e));
     ctx.pipeline = env_flag("GLAS_PIPELINE", true);
@@ -3573,10 +3919,12 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
                 CUDA_CHECK(cudaMalloc(&s.nextc[side], n_large));
                 CUDA_CHECK(cudaMalloc(&s.active[side], n_large * 4));
             }
-            CUDA_CHECK(cudaMalloc(&s.buckets[side], (uint64_t)ctx.max_regions *
+            uint32_t const regions = ctx.max_regions *
+                (side == 1 && ctx.fill_ahead ? ctx.fill_ahead : 1);
+            CUDA_CHECK(cudaMalloc(&s.buckets[side], (uint64_t)regions *
                                                         ctx.bucket_cap[side] * 8));
             CUDA_CHECK(cudaMalloc(&s.bucket_cnt[side],
-                                  ctx.max_regions * BK_CNT_STRIDE * 4));
+                                  regions * BK_CNT_STRIDE * 4));
             CUDA_CHECK(cudaMalloc(&s.rs_idx[side], ctx.n_small[side] * 4));
         }
         CUDA_CHECK(cudaMalloc(&s.rs_cnt, 2 * 4));
@@ -3585,33 +3933,29 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
             CUDA_CHECK(cudaMalloc(&s.select_temp, ctx.select_temp_bytes));
         }
         CUDA_CHECK(cudaMalloc(&s.bitmask, ctx.chunk_area / 8));
+        if (ctx.gate_shift)
+            CUDA_CHECK(cudaMalloc(&s.cgate, ctx.chunk_area / 8 >> ctx.gate_shift));
         for (int par = 0; par < 2; par++) {
             CUDA_CHECK(cudaMalloc(&s.survivors[par], ctx.max_survivors * 4));
             CUDA_CHECK(cudaMalloc(&s.tiny[par], ctx.max_survivors * 16));
             CUDA_CHECK(cudaMalloc(&s.hits[par], ctx.max_hits * 8));
-            CUDA_CHECK(cudaMalloc(&s.counters[par], 3 * 4));
+            CUDA_CHECK(cudaMalloc(&s.counters[par], 4 * 4));
+            if (ctx.rhits) {
+                CUDA_CHECK(cudaMalloc(&s.hits_r[par],
+                                      (uint64_t)ctx.max_regions * RHITS_CAP * 8));
+                CUDA_CHECK(cudaMalloc(&s.hit_rcnt[par], ctx.max_regions * 4));
+                CUDA_CHECK(cudaMalloc(&s.hits_ov[par], RHITS_OV * 8));
+            }
             CUDA_CHECK(cudaEventCreateWithFlags(&s.kdone[par],
                                                 cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&s.odone[par],
                                                 cudaEventDisableTiming));
         }
-        if (ctx.skip & (1 << 17)) {
-            CUDA_CHECK(cudaMalloc(&s.pad_curs, 2 * 4));
-            for (int side = 0; side < 2; side++) {
-                uint64_t const rows = ctx.pad_rows_cap[side];
-                CUDA_CHECK(cudaMalloc(&s.pad[side], rows * 256));
-                CUDA_CHECK(cudaMalloc(&s.pad_rowmap[side], rows * 4));
-            }
-            CUDA_CHECK(cudaStreamCreateWithPriority(&s.pad_stream,
-                                                    cudaStreamNonBlocking,
-                                                    prio_greatest));
-            for (int e = 0; e < 2; e++)
-                CUDA_CHECK(cudaEventCreateWithFlags(&s.pad_ev[e],
-                                                    cudaEventDisableTiming));
-        }
         if (ctx.filter) {
-            CUDA_CHECK(cudaMalloc(&s.hits_sorted, ctx.max_hits * 8));
-            CUDA_CHECK(cudaMalloc(&s.sort_temp, ctx.sort_temp_bytes));
+            if (!ctx.rhits) {
+                CUDA_CHECK(cudaMalloc(&s.hits_sorted, ctx.max_hits * 8));
+                CUDA_CHECK(cudaMalloc(&s.sort_temp, ctx.sort_temp_bytes));
+            }
             CUDA_CHECK(cudaMalloc(&s.fcnt, 2 * 4));
         }
     }
@@ -3633,8 +3977,6 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
                     CUDA_CHECK(cudaMallocHost(
                         &s.h_bucket,
                         4 * ctx.max_regions * BK_CNT_STRIDE * 4));
-                if (ctx.stats && (ctx.skip & (1 << 17)))
-                    CUDA_CHECK(cudaMallocHost(&s.h_pad, 4 * 4));
                 if (ctx.fcand_cap) {
                     CUDA_CHECK(cudaHostAlloc(&s.h_fmeta, ctx.fcand_cap * 4,
                                              mapped));
@@ -3650,34 +3992,27 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
     }
     lap("pinned");
     CUDA_CHECK(cudaFuncSetAttribute(
-        region_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        region_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize,
         REGION_SMEM));
-    if (FILL_SMEM > 0) {
-        CUDA_CHECK(cudaFuncSetAttribute(
-            fill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)FILL_SMEM));
-        for (int side = 0; side < 2; side++)
-            if (ctx.bucket_cap[side] > 0xffff) {
-                fprintf(stderr,
-                        "# GPU: bucket_cap %u exceeds the 16-bit slot of "
-                        "the shared-memory fill queue\n",
-                        ctx.bucket_cap[side]);
-                exit(1);
-            }
-    }
+    CUDA_CHECK(cudaFuncSetAttribute(
+        region_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        REGION_SMEM));
     ctx.free_mask = (1u << ctx.n_slots) - 1;
 
     if (ctx.stats) {
         fprintf(stderr,
                 "# GPU slots: %d, chunk 2^%d, %.2f GB per slot, fill stage "
-                "%d x %u blocks, %u of %u regions staged, bucket slab %d\n",
+                "%d x %u blocks, %u of %u regions staged, bucket slab %d, "
+                "gate shift %u, side-0 tail kernel %d, side-0 candidate "
+                "region %d\n",
                 ctx.n_slots, 63 - __builtin_clzll(ctx.chunk_area),
                 slot_bytes(chunk) / 1073741824.0, ctx.fill_stage,
                 ctx.fill_stage_grid, ctx.fill_stage_regions, ctx.max_regions,
-                ctx.bucket_slab);
+                ctx.bucket_slab, ctx.gate_shift, ctx.fill_tail0,
+                ctx.region_cand);
         for (int k = 0; k < ctx.n_slots; k++) {
             for (int par = 0; par < 2; par++)
-                for (int e = 0; e <= N_PHASES; e++)
+                for (int e = 0; e < N_EVENTS; e++)
                     CUDA_CHECK(cudaEventCreate(&ctx.slot[k].ev[par][e]));
             for (int e = 0; e < 2; e++)
                 CUDA_CHECK(cudaEventCreate(&ctx.slot[k].fev[e]));
@@ -3699,10 +4034,6 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
                 fprintf(stderr, "# GPU bucket max %d: %u of %u, entries %lu\n",
                         side, ctx.bucket_max[side], ctx.bucket_cap[side],
                         (unsigned long)ctx.bucket_sum[side]);
-            for (int side = 0; (ctx.skip & (1 << 17)) && side < 2; side++)
-                fprintf(stderr, "# GPU pad max %d: %u of %lu rows\n",
-                        side, ctx.pad_row_max[side],
-                        ctx.pad_rows_cap[side]);
             report_idle();
             if (ctx.bucket_dump)
                 fclose(ctx.bucket_dump);
@@ -3714,6 +4045,26 @@ bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
 int gpu_slots()
 {
     return ctx.n_slots;
+}
+
+template <bool CAND>
+static void launch_region(gpu_task const & t, gpu_slot const & s,
+                          uint64_t * const * buckets,
+                          uint32_t * const * bucket_cnt, int par, int side)
+{
+    region_kernel<CAND><<<t.nregions, 1024, REGION_SMEM, s.stream>>>(
+        t, ctx.small[side], ctx.n_small[side], ctx.n_dense[side],
+        ctx.n_skip[side], ctx.n_pat[side],
+        s.roots[side], ctx.bucket_cap[side],
+        buckets[side], bucket_cnt[side], side, side == 1,
+        s.bitmask, ctx.max_survivors,
+        s.survivors[par], s.counters[par],
+        ctx.bucket_cap[side ^ 1], buckets[side ^ 1],
+        bucket_cnt[side ^ 1], ctx.max_hits, s.hits[par],
+        s.counters[par] + 1,
+        ctx.rhits ? s.hits_r[par] : nullptr,
+        ctx.rhits ? s.hit_rcnt[par] : nullptr,
+        ctx.rhits ? s.hits_ov[par] : nullptr);
 }
 
 void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
@@ -3756,15 +4107,32 @@ void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
         t.nregions = t.area >> SREG_LOG;
         assert(t.nregions >= 1 && t.area % SREG == 0);
 
+        uint32_t const bank = ctx.fill_ahead ? (j0 / chunk_rows) % ctx.fill_ahead : 0;
+        uint64_t * buckets[2] = {s.buckets[0],
+            s.buckets[1] + (uint64_t)bank * ctx.max_regions * ctx.bucket_cap[1]};
+        uint32_t * bucket_cnt[2] = {s.bucket_cnt[0],
+            s.bucket_cnt[1] + bank * ctx.max_regions * BK_CNT_STRIDE};
         CUDA_CHECK(cudaStreamWaitEvent(st, s.odone[par]));
-        CUDA_CHECK(cudaMemsetAsync(s.counters[par], 0, 3 * 4, st));
-        for (int side = 0; side < 2; side++)
+        CUDA_CHECK(cudaMemsetAsync(s.counters[par], 0, 4 * 4, st));
+        for (int side = 0; side < 2; side++) {
+            if (side == 1 && ctx.fill_ahead && bank)
+                continue;
+            uint32_t const regions = side == 1 && ctx.fill_ahead ?
+                ctx.fill_ahead * ctx.max_regions : t.nregions;
             CUDA_CHECK(cudaMemsetAsync(s.bucket_cnt[side], 0,
-                                       t.nregions * BK_CNT_STRIDE * 4, st));
-        if (ctx.skip & (1 << 17))
-            CUDA_CHECK(cudaMemsetAsync(s.pad_curs, 0, 2 * 4, st));
-        if (ctx.stats)
-            CUDA_CHECK(cudaEventRecord(s.ev[par][0], st));
+                                       regions * BK_CNT_STRIDE * 4, st));
+        }
+        if (ctx.rhits)
+            CUDA_CHECK(cudaMemsetAsync(s.hit_rcnt[par], 0, t.nregions * 4,
+                                       st));
+        int nev = 0;
+        auto mark = [&](int phase) {
+            if (!ctx.stats)
+                return;
+            s.ev_phase[par][nev] = phase;
+            CUDA_CHECK(cudaEventRecord(s.ev[par][nev++], st));
+        };
+        mark(PH_TRANSFORM);
         for (int side = 0; j0 == 0 && side < 2; side++) {
             /* roots do not depend on the chunk */
             uint32_t const n = ctx.n_fb[side];
@@ -3780,56 +4148,148 @@ void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
                                            s.roots[side], s.rs_idx[side],
                                            s.rs_cnt + side);
         }
-        if (ctx.stats)
-            CUDA_CHECK(cudaEventRecord(s.ev[par][1], st));
-        /* one streaming pass per side moves the padded records into the
-         * classic buckets; everything after it runs the classic path */
-        auto flush = [&](int side, cudaStream_t fst) {
-            pad_flush_kernel<<<ctx.pad_grid, 256, 0, fst>>>(
-                s.pad[side], s.pad_rowmap[side], s.pad_curs + side,
-                (uint32_t)ctx.pad_rows_cap[side], ctx.fb[side],
-                ctx.n_small[side], ctx.bucket_cap[side], s.buckets[side],
-                s.bucket_cnt[side],
-                s.counters[par] + 2);
-        };
-        for (int side = 0; side < 2; side++) {
+        mark(PH_TRANSFORM);
+        auto fill = [&](int side, uint32_t const * gate) {
             /* with carry, fill_kernel walks the banded entries only */
-            uint32_t const n = ctx.carry ? ctx.n_band[side] : ctx.n_fb[side];
+            bool const ahead = ctx.fill_ahead && side == 1;
+            bool const tail0 = ctx.fill_tail0 && side == 0;
+            uint32_t const n = ctx.carry ? ctx.n_band[side] :
+                ahead || tail0 ? ctx.n_local[side] : ctx.n_fb[side];
+            if (ahead && !bank && n < ctx.n_fb[side]) {
+                gpu_task next = t;
+                next.rows = std::min(ctx.fill_ahead * chunk_rows, task.J - j0);
+                next.area = next.rows << task.logI;
+                next.nregions = next.area >> SREG_LOG;
+                fill_ahead_kernel<false><<<(ctx.n_fb[side] - n + FILL_THREADS - 1) /
+                                     FILL_THREADS, FILL_THREADS, 0, st>>>(
+                    next, ctx.fb[side], n, ctx.n_fb[side], s.roots[side],
+                    s.walk_x[side], s.lattice[side], ctx.max_regions,
+                    ctx.bucket_cap[side], s.buckets[side], s.bucket_cnt[side],
+                    s.counters[par] + 2, nullptr);
+            }
+            if (tail0 && n < ctx.n_fb[side])
+                fill_ahead_kernel<true><<<(ctx.n_fb[side] - n + FILL_THREADS - 1) /
+                                    FILL_THREADS, FILL_THREADS, 0, st>>>(
+                    t, ctx.fb[side], n, ctx.n_fb[side], s.roots[side],
+                    s.walk_x[side], s.lattice[side], ctx.max_regions,
+                    ctx.bucket_cap[side], buckets[side], bucket_cnt[side],
+                    s.counters[par] + 2, gate);
+            bool const owned = ctx.fill_owners > 1;
+            bool const local = ctx.fill_pair_slots || ctx.fill_row_bands;
+            bool const fused = ((ctx.fill_pair_slots && ctx.fill_pair_fused) ||
+                                (ctx.fill_row_bands && ctx.fill_row_fused)) &&
+                                ctx.n_local[side] > ctx.n_small[side];
+            uint32_t const n_small = owned ? ctx.n_owned[side] :
+                local ? ctx.n_local[side] : ctx.n_small[side];
+            uint32_t const n_band = owned || local ? n_small : ctx.n_band[side];
             uint32_t const n_thr =
-                n - ctx.n_small[side] + (ctx.n_band[side] - ctx.n_small[side]) *
+                n - n_small + (n_band - n_small) *
                                             (ctx.fill_bands - 1);
+            uint32_t const unit = 1u << std::max((int)t.logI - SREG_LOG, 0);
+            uint32_t const owner_regions =
+                (t.nregions / unit + ctx.fill_owners - 1) / ctx.fill_owners * unit;
             uint32_t const n_staged =
-                std::min(t.nregions, ctx.fill_stage_regions);
-            if (n_thr && ctx.fill_stage)
+                std::min(owner_regions, ctx.fill_stage_regions);
+            if (local && ctx.n_local[side] > ctx.n_small[side]) {
+                uint32_t const count = ctx.n_local[side] - ctx.n_small[side];
+                if (ctx.fill_pair_slots) {
+                    uint32_t const total = ctx.fill_pair_fused ? n : ctx.n_local[side];
+                    uint32_t const threads = total - ctx.n_small[side] +
+                        (ctx.n_band[side] - ctx.n_small[side]) * (ctx.fill_bands - 1);
+                    auto launch = [&](auto kernel) {
+                        kernel<<<(threads + FILL_THREADS - 1) / FILL_THREADS,
+                                 FILL_THREADS, 0, st>>>(
+                            t, ctx.fb[side], ctx.n_small[side], ctx.n_band[side],
+                            ctx.fill_bands, total, ctx.n_local[side], s.roots[side],
+                            s.walk_x[side], s.lattice[side], ctx.bucket_cap[side],
+                            buckets[side], bucket_cnt[side], s.counters[par] + 2,
+                            gate);
+                    };
+                    if (ctx.fill_pair_slots == 1024)
+                        launch(fill_local_pair_kernel<10>);
+                    else
+                        launch(fill_local_pair_kernel<12>);
+                } else {
+                    uint32_t const bands = std::min(ctx.fill_row_bands, t.rows);
+                    uint32_t const total = ctx.fill_row_fused ? n : ctx.n_local[side];
+                    uint32_t const window = ctx.fill_row_window_side < 0 ||
+                        ctx.fill_row_window_side == side ? ctx.fill_row_window : 0;
+                    uint32_t const width = window ?
+                        FILL_THREADS * ctx.fill_row_cluster : 32;
+                    uint32_t const row_threads =
+                        (((count + width - 1) / width * width * bands + FILL_THREADS - 1) /
+                         FILL_THREADS) * FILL_THREADS;
+                    uint32_t const threads = row_threads + total - ctx.n_local[side];
+                    auto launch = [&](auto kernel) {
+                        kernel<<<(threads + FILL_THREADS - 1) / FILL_THREADS,
+                                 FILL_THREADS, 0, st>>>(
+                            t, ctx.fb[side], ctx.n_small[side], ctx.n_local[side], total,
+                            bands, s.roots[side], s.walk_x[side], s.lattice[side], ctx.bucket_cap[side],
+                            buckets[side], bucket_cnt[side], s.counters[par] + 2,
+                            gate);
+                    };
+                    if (window) {
+                        uint32_t const c = ctx.fill_row_cluster;
+                        cudaLaunchAttribute attr{};
+                        attr.id = cudaLaunchAttributeClusterDimension;
+                        attr.val.clusterDim = {c, 1, 1};
+                        cudaLaunchConfig_t config{};
+                        config.gridDim = {(threads + FILL_THREADS * c - 1) / (FILL_THREADS * c) * c, 1, 1};
+                        config.blockDim = {FILL_THREADS, 1, 1};
+                        config.dynamicSmemBytes = 2 * window * unit * sizeof(uint32_t);
+                        config.stream = st;
+                        config.attrs = &attr;
+                        config.numAttrs = c > 1 ? 1 : 0;
+                        auto reserve = [&](auto kernel) {
+                            CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, t, ctx.fb[side],
+                                ctx.n_small[side], ctx.n_local[side], total, bands, s.roots[side],
+                                s.walk_x[side], s.lattice[side], ctx.bucket_cap[side], buckets[side],
+                                bucket_cnt[side], s.counters[par] + 2, gate));
+                        };
+                        bool const lean = ctx.fill_row_window_lean;
+                        bool const b6 = ctx.fill_row_window_blocks == 6;
+                        if (window == 8) {
+                            if (c == 2) reserve(fill_row_kernel<true, 8, 2>);
+                            else if (lean && b6) reserve(fill_row_kernel<true, 8, 1, true, 6>);
+                            else if (lean) reserve(fill_row_kernel<true, 8, 1, true>);
+                            else if (b6) reserve(fill_row_kernel<true, 8, 1, false, 6>);
+                            else reserve(fill_row_kernel<true, 8, 1>);
+                        } else if (window == 16) {
+                            if (c == 1) reserve(fill_row_kernel<true, 16, 1>);
+                            else reserve(fill_row_kernel<true, 16, 2>);
+                        } else {
+                            if (c == 1) reserve(fill_row_kernel<true, 32, 1>);
+                            else reserve(fill_row_kernel<true, 32, 2>);
+                        }
+                    } else if (ctx.fill_row_group)
+                        launch(fill_row_kernel<true>);
+                    else
+                        launch(fill_row_kernel<false>);
+                }
+            }
+            if (ctx.fill_stage && (n_thr || owned))
                 fill_stage_kernel<<<ctx.fill_stage_grid, FILL_STAGE_THREADS,
                                     (size_t)n_staged * 8, st>>>(
-                    t, ctx.fb[side], ctx.n_small[side], ctx.n_band[side],
-                    ctx.fill_bands, n,
+                    t, ctx.fb[side], ctx.n_small[side],
+                    owned ? ctx.n_small[side] : ctx.n_band[side],
+                    owned ? 1 : ctx.fill_bands, owned ? ctx.n_owned[side] : n,
                     s.roots[side], s.walk_x[side], s.lattice[side],
-                    n_staged, ctx.bucket_cap[side], s.buckets[side],
-                    s.bucket_cnt[side], s.counters[par] + 2);
-            else if (n_thr)
+                    owned && !ctx.fill_owner_pairs ? 0 : n_staged,
+                    ctx.bucket_cap[side], buckets[side],
+                    bucket_cnt[side], s.counters[par] + 2, ctx.fill_owners,
+                    gate);
+            if (n_thr && (!ctx.fill_stage || owned) &&
+                !fused)
                 fill_kernel<<<(n_thr + FILL_THREADS - 1) / FILL_THREADS,
-                              FILL_THREADS, FILL_SMEM, st>>>(
-                    t, ctx.fb[side], ctx.n_small[side], ctx.n_band[side],
+                              FILL_THREADS, 0, st>>>(
+                    t, ctx.fb[side], n_small, n_band,
                     ctx.fill_bands, n,
                     s.roots[side], s.walk_x[side], s.lattice[side],
-                    ctx.bucket_cap[side], s.buckets[side],
-                    s.bucket_cnt[side], s.counters[par] + 2, s.pad[side],
-                    s.pad_rowmap[side], s.pad_curs + side,
-                    (uint32_t)ctx.pad_rows_cap[side]);
-            /* the side-0 flush runs on its own stream, concurrent with
-             * the side-1 fill; the sieve stream joins it before the
-             * region kernels read the side-0 buckets */
-            if ((ctx.skip & (1 << 17)) && side == 0) {
-                CUDA_CHECK(cudaEventRecord(s.pad_ev[0], st));
-                CUDA_CHECK(cudaStreamWaitEvent(s.pad_stream, s.pad_ev[0]));
-                flush(0, s.pad_stream);
-                CUDA_CHECK(cudaEventRecord(s.pad_ev[1], s.pad_stream));
-            }
+                    ctx.bucket_cap[side], buckets[side],
+                    bucket_cnt[side], s.counters[par] + 2, gate);
             uint32_t const n_large = ctx.n_fb[side] - ctx.n_band[side];
             if (!ctx.carry || !n_large)
-                continue;
+                return;
             uint32_t const chunk_log = __builtin_ctzll(ctx.chunk_area);
             uint32_t const cur = (uint32_t)(((uint64_t)j0 << t.logI) >> chunk_log);
             size_t tmp_bytes = ctx.select_temp_bytes;
@@ -3840,56 +4300,62 @@ void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
             fill_carry_kernel<<<ctx.carry_grid, 256, 0, st>>>(
                 t, chunk_log, ctx.fb[side], s.roots[side], ctx.n_band[side],
                 s.active[side], s.n_active + side, s.carry[side],
-                s.nextc[side], ctx.bucket_cap[side], s.buckets[side],
-                s.bucket_cnt[side], s.counters[par] + 2);
-        }
-        if (ctx.skip & (1 << 17)) {
-            flush(1, st);
-            CUDA_CHECK(cudaStreamWaitEvent(st, s.pad_ev[1]));
-            for (int side = 0; ctx.stats && side < 2; side++)
-                CUDA_CHECK(cudaMemcpyAsync(s.h_pad + 2 * par + side,
-                                           s.pad_curs + side, 4,
-                                           cudaMemcpyDeviceToHost, st));
-        }
-        if (ctx.stats) {
-            CUDA_CHECK(cudaEventRecord(s.ev[par][2], st));
-            /* peak read at the chunk's processing step */
-            for (int side = 0; side < 2; side++)
-                CUDA_CHECK(cudaMemcpyAsync(
-                    s.h_bucket +
-                        (2 * par + side) * ctx.max_regions * BK_CNT_STRIDE,
-                    s.bucket_cnt[side],
-                    t.nregions * BK_CNT_STRIDE * 4,
-                    cudaMemcpyDeviceToHost, st));
-        }
+                s.nextc[side], ctx.bucket_cap[side], buckets[side],
+                bucket_cnt[side], s.counters[par] + 2);
+        };
         /* side 1 fills the bitmask, side 0 intersects, emits survivors
          * and rescans both bucket lists for the resieve hits */
-        for (int side = 1; side >= 0; side--)
-            region_kernel<<<t.nregions, 1024, REGION_SMEM, st>>>(
-                t, ctx.small[side], ctx.n_small[side], ctx.n_dense[side],
-                ctx.n_skip[side], ctx.n_pat[side],
-                s.roots[side], ctx.bucket_cap[side],
-                s.buckets[side], s.bucket_cnt[side], side, side == 1,
-                s.bitmask, ctx.max_survivors,
-                s.survivors[par], s.counters[par],
-                ctx.bucket_cap[side ^ 1], s.buckets[side ^ 1],
-                s.bucket_cnt[side ^ 1], ctx.max_hits, s.hits[par],
-                s.counters[par] + 1);
-        if (ctx.stats)
-            CUDA_CHECK(cudaEventRecord(s.ev[par][3], st));
+        auto region = [&](int side) {
+            if (side == 0 && ctx.region_cand)
+                launch_region<1>(t, s, buckets, bucket_cnt, par, side);
+            else
+                launch_region<0>(t, s, buckets, bucket_cnt, par, side);
+        };
+        if (ctx.fill_gate) {
+            /* GLAS_FILL_GATE: the side-0 fill runs after the side-1
+             * region kernel and stores only the hits under its mask */
+            fill(1, nullptr);
+            mark(PH_FILL);
+            region(1);
+            mark(PH_REGION);
+            if (ctx.gate_shift) {
+                uint32_t const words = t.area >> (5 + ctx.gate_shift);
+                gate_fold_kernel<<<(words + 255) / 256, 256, 0, st>>>(
+                    s.bitmask, s.cgate, ctx.gate_shift, words);
+            }
+            fill(0, ctx.gate_shift ? s.cgate : s.bitmask);
+            mark(PH_FILL);
+            region(0);
+            mark(PH_REGION);
+        } else {
+            fill(0, nullptr);
+            fill(1, nullptr);
+            mark(PH_FILL);
+            region(1);
+            region(0);
+            mark(PH_REGION);
+        }
+        /* peak read at the chunk's processing step */
+        for (int side = 0; ctx.stats && side < 2; side++)
+            CUDA_CHECK(cudaMemcpyAsync(
+                s.h_bucket + (2 * par + side) * ctx.max_regions * BK_CNT_STRIDE,
+                bucket_cnt[side], t.nregions * BK_CNT_STRIDE * 4,
+                cudaMemcpyDeviceToHost, st));
         tiny_mask_kernel<<<ctx.tiny_grid, 256, 0, st>>>(t, s.survivors[par],
                                               s.counters[par],
                                               ctx.max_survivors, s.tiny[par]);
-        if (ctx.stats)
-            CUDA_CHECK(cudaEventRecord(s.ev[par][4], st));
+        mark(PH_TINY);
         for (int side = 0; side < 2; side++)
             resieve_small_kernel<<<ctx.rs_grid, 256, 0, st>>>(
                 t, ctx.small[side], s.rs_idx[side], s.rs_cnt + side,
                 s.roots[side], side, s.survivors[par],
                 s.counters[par], ctx.max_survivors, ctx.max_hits,
-                s.hits[par], s.counters[par] + 1);
-        if (ctx.stats)
-            CUDA_CHECK(cudaEventRecord(s.ev[par][5], st));
+                s.hits[par], s.counters[par] + 1,
+                ctx.rhits ? s.hits_r[par] : nullptr,
+                ctx.rhits ? s.hit_rcnt[par] : nullptr,
+                ctx.rhits ? s.hits_ov[par] : nullptr);
+        mark(PH_RESIEVE);
+        s.n_ev[par] = nev;
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(s.kdone[par], st));
         tpar[par] = t;
@@ -3926,16 +4392,17 @@ void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
         if (ctx.stats) {
             trace_scope const tr(TR_STATS);
             std::unique_lock<std::mutex> const lk(ctx.lock);
-            for (int p = 0; p < N_PHASES; p++) {
+            int const nev = s.n_ev[par];
+            for (int e = 1; e < nev; e++) {
                 float ms = 0;
-                CUDA_CHECK(cudaEventElapsedTime(&ms, s.ev[par][p],
-                                                s.ev[par][p + 1]));
-                ctx.phase_ms[p] += ms;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, s.ev[par][e - 1],
+                                                s.ev[par][e]));
+                ctx.phase_ms[s.ev_phase[par][e]] += ms;
             }
             float a = 0, b = 0;
             CUDA_CHECK(cudaEventElapsedTime(&a, ctx.ref, s.ev[par][0]));
             CUDA_CHECK(cudaEventElapsedTime(&b, ctx.ref,
-                                            s.ev[par][N_PHASES]));
+                                            s.ev[par][nev - 1]));
             ctx.spans[slot].emplace_back(a, b);
             for (int side = 0; side < 2; side++) {
                 uint32_t const * const c =
@@ -3958,9 +4425,6 @@ void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
                     fputc('\n', ctx.bucket_dump);
                 }
             }
-            for (int side = 0; (ctx.skip & (1 << 17)) && side < 2; side++)
-                ctx.pad_row_max[side] = std::max(
-                    ctx.pad_row_max[side], s.h_pad[2 * par + side]);
         }
 
         uint32_t const n_surv = s.h_counters[0];
@@ -3996,11 +4460,12 @@ void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
         uint32_t n_out = ctx.filter ? 0 : n_surv;
         uint32_t n_hits_out = ctx.filter ? 0 : n_hits;
         if (ctx.filter && n_surv) {
-            size_t tmp_bytes = ctx.sort_temp_bytes;
-            if (n_hits)
+            if (n_hits && !ctx.rhits) {
+                size_t tmp_bytes = ctx.sort_temp_bytes;
                 CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
                     s.sort_temp, tmp_bytes, s.hits[par], s.hits_sorted,
                     n_hits, 0, 64, s.out_stream));
+            }
             CUDA_CHECK(cudaMemsetAsync(s.fcnt, 0, 2 * 4, s.out_stream));
             if (ctx.stats)
                 CUDA_CHECK(cudaEventRecord(s.fev[0], s.out_stream));
@@ -4008,7 +4473,12 @@ void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
                 std::min(ctx.filter_grid, (n_surv + 255) / 256);
             filter_kernel<<<fgrid, 256, 0, s.out_stream>>>(
                 tc, s.survivors[par], n_surv, s.tiny[par], s.hits_sorted,
-                n_hits, s.h_survivors, s.h_tiny, s.fcnt, s.h_fmeta,
+                n_hits,
+                ctx.rhits ? s.hits_r[par] : nullptr,
+                ctx.rhits ? s.hit_rcnt[par] : nullptr,
+                ctx.rhits ? s.hits_ov[par] : nullptr,
+                s.counters[par] + 3,
+                s.h_survivors, s.h_tiny, s.fcnt, s.h_fmeta,
                 s.h_ffac, s.h_flo, ctx.fcand_cap, s.h_hits);
             if (ctx.fcand_cap && !ctx.host_mr)
                 filter_prime_kernel<<<(ctx.fcand_cap + 255) / 256, 256, 0,

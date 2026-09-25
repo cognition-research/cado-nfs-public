@@ -62,6 +62,7 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <numeric>
 #include <ostream>
 
 #include <memory>
@@ -307,6 +308,27 @@ struct dup2_process { /* {{{ */
     /* Number of duplicates and rels on all read files */
     size_t ndup_tot = 0;
     size_t nrels_tot = 0;
+
+    /* Relations with gcd(a,b) > 1, removed like duplicates. A sieve
+     * relation can have gcd(a,b) = q when q divides b (the q-lattice
+     * is the (a,b) with a == rho*b mod q); las rejects those before
+     * output, but relations from other sievers may contain them, and
+     * their prime factors (q itself, above the factor base bounds
+     * with a root that is not a root of the polynomial) are not in
+     * the renumber table. */
+    size_t nskip = 0;
+    size_t nskip_tot = 0;
+
+    static bool ab_coprime(int64_t a, uint64_t b)
+    {
+        return std::gcd(a < 0 ? -(uint64_t) a : (uint64_t) a, b) == 1;
+    }
+    static bool ab_coprime(cxx_mpz const & a, cxx_mpz const & b)
+    {
+        cxx_mpz g;
+        mpz_gcd(g, a, b);
+        return mpz_cmp_ui(g, 1) == 0;
+    }
     size_t nrels_already_renumbered = 0;
 
     /* {{{ sanity check: we store (a,b) pairs for 0 <= i < sanity_size,
@@ -541,6 +563,10 @@ struct dup2_process { /* {{{ */
 
         auto & srel = std::get<0>(rel);
 
+        /* leave the sieve relation in place: thread_dup2 drops it */
+        if (!ab_coprime(srel.a, srel.b))
+            return;
+
         uint64_t nonvoidside = 0; /* bit vector of which sides appear in the rel */
 
         indexed_rel_type irel;
@@ -666,12 +692,21 @@ struct dup2_process { /* {{{ */
     template<typename relation_type> void thread_dup2(std::ostream& out, relation_type & rel)
     {
         using indexed_rel_type = std::variant_alternative_t<1, relation_type>;
-        ASSERT_ALWAYS(std::holds_alternative<indexed_rel_type>(rel));
+
+        nrels++;
+        nrels_tot++;
+
+        if (!std::holds_alternative<indexed_rel_type>(rel)) {
+            /* non-coprime (a,b): removed like a duplicate */
+            ndup++;
+            ndup_tot++;
+            nskip++;
+            nskip_tot++;
+            return;
+        }
         auto & irel = std::get<1>(rel);
 
         bool is_dup;
-        nrels++;
-        nrels_tot++;
         const uint64_t i = insert_relation_in_dup_hashtable(irel, is_dup);
 
         if (!is_dup) {
@@ -690,6 +725,10 @@ struct dup2_process { /* {{{ */
                 s, nrels, ndup,
                 100.0 * double_ratio(ndup, nrels),
                 nrels - ndup);
+        if (nskip_tot)
+            fmt::print(stderr,
+                    "{}: skipped {} non-coprime relations (total {})\n",
+                    s, nskip, nskip_tot);
         fmt::print(stderr, "Total so far: nrels={} dup={} ({:.2f}%) rem={}\n",
                 nrels_tot, ndup_tot,
                 100.0 * double_ratio(ndup_tot, nrels_tot),
@@ -718,7 +757,7 @@ struct dup2_process { /* {{{ */
         for(auto const & f : files) {
             auto [ oname, oname_tmp ] = output.get_outfilename_from_infilename(f);
             ofstream_maybe_compressed out(oname_tmp);
-            nrels = ndup = 0;
+            nrels = ndup = nskip = 0;
 
             using cado::filter_io_details::multithreaded_call;
 

@@ -25,8 +25,9 @@
  * rows of each device cut at the block boundaries, so at most one block
  * per device more than the block count). 64 blocks per communicator
  * cover the grids in use, the widest being 16 jobs. */
-#define BWC_DEV_PIECES_MAGIC 0x50494543455f4445ull
+#define BWC_DEV_PIECES_MAGIC 0x50494543455f4432ull
 #define BWC_DEV_PIECES_MAX 64
+#define BWC_DEV_WBANDS_MAX 1024
 
 struct bwc_dev_pieces;
 
@@ -91,6 +92,50 @@ struct bwc_dev_pieces {
     size_t blk_bytes;
     int nblk;
     int blk[BWC_DEV_PIECES_MAX];
+
+    /* out_only, set by the plugin, lets the next product into this
+     * arena leave the mirror rows of the devices that do not write the
+     * mirror in place unwritten: the plugin reads the output segments
+     * and writes the whole mirror again. [stale_lo, stale_hi) is the
+     * mirror range such a product left unwritten (empty when equal);
+     * a writer of the mirror clears the part it writes, and a reader
+     * of the range aborts. */
+    bool out_only;
+    size_t stale_lo, stale_hi;
+
+    /* The writes of the last allgather into the replicas and the
+     * mirror, set by the plugin: the range [wb[i].off, wb[i].off +
+     * wb[i].bytes) of the replica on wb[i].device (-1: the mirror) is
+     * complete behind wb[i].ready. The records hold while wb_wgen ==
+     * wgen; a reader waits on the mirror bands for the part of its
+     * range that no record of its target covers. */
+    int nwb;
+    uint64_t wb_wgen;
+    bwc_dev_piece wb[BWC_DEV_WBANDS_MAX];
 };
+
+/* Remove the written range [off, off + bytes) from the stale range,
+ * when it covers one end of it; a write inside the range leaves the
+ * whole range stale. */
+static inline void bwc_dev_stale_clear(bwc_dev_pieces * p, size_t off,
+        size_t bytes)
+{
+    size_t const end = off + bytes;
+    if (end <= p->stale_lo || p->stale_hi <= off)
+        return;
+    if (off <= p->stale_lo && p->stale_hi <= end)
+        p->stale_hi = p->stale_lo;
+    else if (off <= p->stale_lo)
+        p->stale_lo = end;
+    else if (p->stale_hi <= end)
+        p->stale_hi = off;
+}
+
+static inline bool bwc_dev_stale_hits(bwc_dev_pieces const * p, size_t off,
+        size_t bytes)
+{
+    return p->stale_lo < p->stale_hi
+        && off < p->stale_hi && p->stale_lo < off + bytes;
+}
 
 #endif

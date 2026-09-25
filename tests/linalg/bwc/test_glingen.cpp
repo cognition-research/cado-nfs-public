@@ -22,12 +22,18 @@
 /* The operations of dmatpoly (lingen_gpu.hpp) against those of
  * matpoly<true>, on the plugin named by lingen_ft_impl. */
 
+/* columns 37 z mod n for z < zeros are zero, so that the base case
+ * sees lucky columns */
 static matpoly<true> random_matpoly(matpoly<true>::arith_hard * ab,
-        unsigned int m, unsigned int n, size_t L, cxx_gmp_randstate & rstate)
+        unsigned int m, unsigned int n, size_t L, unsigned int zeros,
+        cxx_gmp_randstate & rstate)
 {
     matpoly<true> E(ab, m, n, L);
     E.zero_pad(L);
     E.fill_random(0, L, rstate);
+    for (unsigned int z = 0; z < zeros; z++)
+        for (unsigned int i = 0; i < m; i++)
+            std::fill_n(E.part(i, (37 * z) % n), E.capacity() / ULONG_BITS, 0UL);
     return E;
 }
 
@@ -122,7 +128,7 @@ int main(int argc, char const * argv[])
 {
     MPI_Init(&argc, (char ***) &argv);
 
-    unsigned int m = 64, n = 64, L = 200, threshold = 60;
+    unsigned int m = 64, n = 64, L = 200, threshold = 60, zeros = 0;
     unsigned long seed = 0;
     cxx_param_list pl;
     pl.process_command_line(argc, argv, false);
@@ -131,6 +137,8 @@ int main(int argc, char const * argv[])
     pl.parse("L", L);
     pl.parse("threshold", threshold);
     pl.parse("seed", seed);
+    pl.parse("zeros", zeros);
+    ASSERT_ALWAYS(zeros <= m + n);
     lingen_ft_plugin_init(pl);
     ASSERT_ALWAYS(bwc_lingen_ft_plugin);
 
@@ -140,11 +148,13 @@ int main(int argc, char const * argv[])
     matpoly<true>::arith_hard ab(p, 1U);
     matpoly<true>::memory_guard const blanket(SIZE_MAX);
 
-    matpoly<true> const E = random_matpoly(&ab, m, m + n, L, rstate);
+    matpoly<true> const E = random_matpoly(&ab, m, m + n, L, zeros, rstate);
     test_shifts(E);
     matpoly<true> const pi = test_basecase(E, m, n);
     test_products(E, pi);
-    test_recursion(E, m, n, threshold);
+    /* with zero columns, the CPU recursion stops at its pi length check */
+    if (!zeros)
+        test_recursion(E, m, n, threshold);
 
     MPI_Finalize();
 }

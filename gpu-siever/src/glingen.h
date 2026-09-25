@@ -102,7 +102,7 @@ void glingen_mp_product(struct glingen_polys c, struct glingen_polys a,
  * The iteration of lingen_qcode_binary (generator_found, the pivot
  * search of bpack_view::ple, the update of E and pi) on the device,
  * with the same pivot order as the CPU code. b and m are multiples of
- * 64, b at most 1024. */
+ * 64, b at most 2048. */
 struct glingen_bc {
     struct glingen_polys E;     /* m x b, L = E.bits coefficients */
     unsigned int m, b;

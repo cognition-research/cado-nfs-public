@@ -37,6 +37,7 @@
 #include <vector>
 #include <ostream>
 #include <ios>
+#include <sstream>
 
 #include <sys/stat.h>
 
@@ -222,8 +223,7 @@ static void accumulate(std::vector<typename M::T> & A, typename std::vector<type
     }
     *vb = std::move(A.back());
 }
-/* not used, just to mention that the simplest prototype for the function
- * above would be as follows, in a way */
+
 template<typename M>
 static void accumulate(typename std::vector<typename M::T>::iterator vb, typename std::vector<typename M::T>::iterator ve, M const & m)
 {
@@ -450,6 +450,13 @@ requires requires { m.from_ab(cxx_mpz(), cxx_mpz()); }
 
 using ab_pair = std::pair<int64_t, uint64_t>;
 
+template<typename M>
+static typename M::T product_of_leaves(std::vector<typename M::T> & leaves, M const & m)
+{
+    accumulate(leaves.begin(), leaves.end(), m);
+    return std::move(leaves.front());
+}
+
 /* The product of the leaves of one range of (a,b) pairs, for the M that
  * have no range product of their own */
 template<typename M>
@@ -462,9 +469,19 @@ static typename M::T product_of_leaves(std::vector<ab_pair> const & ab, M const 
         mpz_set_ui(b, bv);
         leaves.emplace_back(m.from_ab(a, b));
     }
-    std::vector<typename M::T> A;
-    accumulate(A, leaves.begin(), leaves.end(), m);
-    return std::move(leaves.front());
+    return product_of_leaves(leaves, m);
+}
+
+/* The product of the leaves of one range whose text has a coordinate
+ * beyond 64 bits (dependency files written with -large-ab) */
+template<typename M>
+static typename M::T product_of_large_leaves(std::string const & text, M const & m)
+{
+    std::vector<typename M::T> leaves;
+    cxx_mpz a, b;
+    for (std::istringstream in(text); in >> a >> b; )
+        leaves.emplace_back(m.from_ab(a, b));
+    return product_of_leaves(leaves, m);
 }
 
 /* The floor level of the product tree, read from the dependency file:
@@ -519,25 +536,30 @@ requires requires { m.from_ab(cxx_mpz(), cxx_mpz()); }
 #pragma omp for schedule(dynamic) reduction(+:ab,fr)
         for (size_t i = 0; i < npieces; i++) {
             /* the whole range in memory: the lines "a b" of the range, a
-             * signed and b unsigned 64-bit, are parsed with strtoll */
+             * signed and b unsigned 64-bit, are parsed with strtoll; a
+             * range with a larger coordinate is parsed again as mpz */
             text.resize(start[i+1] - start[i]);
             ASSERT_ALWAYS(fseek(fi, start[i], SEEK_SET) == 0);
             ASSERT_ALWAYS(fread(text.data(), 1, text.size(), fi) == text.size());
             ab_range.clear();
+            bool large = false;
             for (char * p = text.data(), * end = p + text.size(); p < end; ) {
                 errno = 0;
                 char * q;
                 const long long av = strtoll(p, &q, 10);
                 ASSERT_ALWAYS(q > p && *q == ' ');
                 const unsigned long long bv = strtoull(q, &p, 10);
-                ASSERT_ALWAYS(p > q && (*p == '\n' || p == end) && errno == 0);
+                ASSERT_ALWAYS(p > q && (*p == '\n' || p == end));
+                large |= errno == ERANGE;
                 p++;
                 ab_range.emplace_back(av, bv);
                 fr += bv == 0;
             }
             ab += ab_range.size();
             m.set1(v[i]);
-            if (!ab_range.empty())
+            if (large)
+                v[i] = product_of_large_leaves(text, m);
+            else if (!ab_range.empty())
                 v[i] = m.range_product(ab_range);
             const std::scoped_lock<std::mutex> dummy(stdio_guard);
             fmt::print (stderr, "{}: fragment {}/{} of level 00 ({} pairs) done by thread {} at wct={:1.2f}s\n",

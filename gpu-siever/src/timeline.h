@@ -51,10 +51,17 @@ static inline bool tl_on()
     return all || tl_rank() == 0;
 }
 
+/* a library can take its first call from an environment variable of its
+ * own (TL_K0_ENV), since its call count need not match the product's */
+#ifndef TL_K0_ENV
+#define TL_K0_ENV "SPMV_GF2_TIMELINE_K0"
+#endif
+
 static inline unsigned long tl_k0()
 {
-    static unsigned long const k0 = getenv("SPMV_GF2_TIMELINE_K0")
-        ? strtoul(getenv("SPMV_GF2_TIMELINE_K0"), nullptr, 10) : 1100;
+    static const char * const s = getenv(TL_K0_ENV)
+        ? getenv(TL_K0_ENV) : getenv("SPMV_GF2_TIMELINE_K0");
+    static unsigned long const k0 = s ? strtoul(s, nullptr, 10) : 1100;
     return k0;
 }
 

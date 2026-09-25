@@ -20,6 +20,7 @@
 #include "select_mpi.h"
 
 #include "comm_xor.h"
+#define TL_K0_ENV "BWC_NCCL_TIMELINE_K0"
 #include "timeline.h"
 
 static tl_state tl = { {}, 0, nullptr, {}, "nccl" };
@@ -65,7 +66,22 @@ static unsigned long tl_k = 0;
  * never waits for the fan-out still in flight. The events that cover
  * every lane (the band events and the ready marker) are recorded on
  * a publication stream of the mirror device (comm_state::pub), so
- * the lane streams never wait for one another. */
+ * the lane streams never wait for one another.
+ *
+ * BWC_NCCL_HOLDER=1 replaces the equal lane slices of a device buffer
+ * with the pieces the devices hold. The ranks swap the layouts of
+ * their product output (the output segments cut at the block
+ * boundaries, and the mirror for the rest) over MPI at each
+ * reduce-scatter, and one NCCL communicator spans every lane of every
+ * rank. Each overlap of two layouts goes from the device that holds
+ * it on one rank to the device that holds it on the other, which
+ * receives into its accumulation area (lane::acc) and XORs its own
+ * segment in, so no slice stages onto a lane device. The allgather
+ * sends the result pieces from their holders and receives each piece
+ * straight into the replica (or the mirror) on the device of the same
+ * lane index, which copies it on to the mirror and the other replicas.
+ * A device buffer without output segments or a lane without a replica
+ * or the mirror aborts; host buffers keep the host staging. */
 
 #define CUDA_CHECK(call) do {                                           \
     cudaError_t const e = (call);                                       \
@@ -95,6 +111,7 @@ namespace {
 struct band_store {
     std::vector<cudaEvent_t> ev;
     std::vector<bwc_device_band> bands;
+    std::vector<std::vector<cudaEvent_t>> wbev; /* per lane: the write records */
 };
 
 /* One lane: a device, its NCCL communicator over the MPI
@@ -118,6 +135,26 @@ struct lane {
     uint8_t * tmp = nullptr;    /* one slice per receive of a step */
     size_t slice_alloc = 0;
     int cur = 0;                /* the staging half of this exchange */
+    ncclComm_t hnccl = nullptr; /* BWC_NCCL_HOLDER: every lane of every rank */
+    uint8_t * acc[2] = { nullptr, nullptr };    /* the pieces this lane holds */
+    size_t acc_alloc[2] = { 0, 0 };
+    uint8_t * htmp = nullptr;   /* reduce-scatter receives past the first */
+    size_t htmp_alloc = 0;
+    uint8_t * agtmp = nullptr;  /* allgather receives without replicas */
+    size_t agtmp_alloc = 0;
+};
+
+/* A layout piece as the ranks swap it: a range of the buffer and the
+ * lane index of the device that holds it. */
+#define HOLDER_MAX 256
+struct hwire {
+    uint64_t off, bytes;
+    int64_t lane;
+};
+
+struct hlayout {
+    int64_t n;
+    hwire w[HOLDER_MAX];
 };
 
 /* The lanes of one MPI communicator, made on first use. bwc uses one
@@ -131,6 +168,10 @@ struct comm_state {
     int njobs;
     bool direct_rs, direct_ag;  /* BWC_NCCL_DIRECT names the leg */
     bool stg_streams;           /* BWC_NCCL_STG_STREAMS=1: one staging stream per block */
+    bool holder;                /* BWC_NCCL_HOLDER=1 */
+    bool nomirror;              /* BWC_NCCL_HOLDER_NOMIRROR=1 */
+    bool wbands;                /* BWC_NCCL_HOLDER_WBANDS=1 */
+    bool holder_started = false; /* a device buffer took the holder exchange */
     std::map<bwc_device_arena *, band_store> stores;
 };
 
@@ -245,6 +286,22 @@ comm_state & get_state(MPI_Comm comm)
     s->direct_ag = direct && strstr(direct, "ag");
     const char * const stg = getenv("BWC_NCCL_STG_STREAMS");
     s->stg_streams = stg && atoi(stg) == 1;
+    const char * const holder = getenv("BWC_NCCL_HOLDER");
+    s->holder = holder && atoi(holder) == 1;
+    const char * const nomirror = getenv("BWC_NCCL_HOLDER_NOMIRROR");
+    s->nomirror = nomirror && atoi(nomirror) == 1;
+    if (s->nomirror && !s->holder) {
+        fprintf(stderr, "bwccomm_nccl: BWC_NCCL_HOLDER_NOMIRROR needs"
+                " BWC_NCCL_HOLDER=1\n");
+        abort();
+    }
+    const char * const wbands = getenv("BWC_NCCL_HOLDER_WBANDS");
+    s->wbands = wbands && atoi(wbands) == 1;
+    if (s->wbands && !s->holder) {
+        fprintf(stderr, "bwccomm_nccl: BWC_NCCL_HOLDER_WBANDS needs"
+                " BWC_NCCL_HOLDER=1\n");
+        abort();
+    }
     int ndev;
     CUDA_CHECK(cudaGetDeviceCount(&ndev));
     int const ngpu = env_ngpu() < ndev ? env_ngpu() : ndev;
@@ -285,6 +342,28 @@ comm_state & get_state(MPI_Comm comm)
                         cudaEventDisableTiming));
             l.blk.push_back(bev);
         }
+    }
+    if (s->holder && s->njobs > 1) {
+        int lo = ngpu, hi = ngpu;
+        MPI_Allreduce(MPI_IN_PLACE, &lo, 1, MPI_INT, MPI_MIN, comm);
+        MPI_Allreduce(MPI_IN_PLACE, &hi, 1, MPI_INT, MPI_MAX, comm);
+        if (lo != hi) {
+            fprintf(stderr, "bwccomm_nccl: BWC_NCCL_HOLDER needs the same"
+                    " lane count on every rank (%d to %d)\n", lo, hi);
+            abort();
+        }
+        ncclUniqueId id;
+        if (s->rank == 0)
+            NCCL_CHECK(ncclGetUniqueId(&id));
+        MPI_Bcast(&id, sizeof(id), MPI_BYTE, 0, comm);
+        NCCL_CHECK(ncclGroupStart());
+        for (int d = 0; d < ngpu; d++) {
+            lane & l = s->lanes[d];
+            CUDA_CHECK(cudaSetDevice(l.device));
+            NCCL_CHECK(ncclCommInitRank(&l.hnccl, s->njobs * ngpu, id,
+                        s->rank * ngpu + d));
+        }
+        NCCL_CHECK(ncclGroupEnd());
     }
     CUDA_CHECK(cudaSetDevice(s->lanes[0].device));
     CUDA_CHECK(cudaStreamCreate(&s->pub));
@@ -705,6 +784,749 @@ std::vector<size_t> active_lanes(comm_state & s, size_t block_bytes)
     return ds;
 }
 
+/* A piece of the local layout: the range [off, off + bytes) of the
+ * buffer on lane, read from src behind ready (the band and ready events
+ * of the mirror when ready is null), with owner as the record of the
+ * memory, and acc as its offset in the accumulation area of the lane. */
+struct hpiece {
+    size_t off, bytes;
+    int lane;
+    char * src;
+    cudaEvent_t ready;
+    bwc_dev_pieces * owner;
+    size_t acc;
+};
+
+/* An overlap of two layouts: indices a and c of the pieces that hold
+ * it. */
+struct hcut {
+    size_t off, bytes;
+    int a, c;
+};
+
+[[noreturn]] void holder_fail(const char * what)
+{
+    fprintf(stderr, "bwccomm_nccl: BWC_NCCL_HOLDER: %s\n", what);
+    abort();
+}
+
+int lane_of(comm_state const & s, int device)
+{
+    for (size_t d = 0; d < s.lanes.size(); d++)
+        if (s.lanes[d].device == device)
+            return (int) d;
+    holder_fail("a piece is on a device outside the lanes");
+}
+
+void grow(uint8_t * & p, size_t & alloc, size_t want)
+{
+    if (alloc >= want)
+        return;
+    CUDA_CHECK(cudaFree(p));
+    CUDA_CHECK(cudaMalloc(&p, want));
+    alloc = want;
+}
+
+void mirror_piece(std::vector<hpiece> & whole, bwc_dev_pieces const * p,
+        dev_view const & v, size_t at, size_t bytes, int ml)
+{
+    if (bwc_dev_stale_hits(p, v.off + at, bytes))
+        holder_fail("a mirror piece holds rows the product left to the plugin");
+    whole.push_back({ at, bytes, ml, v.p + at, nullptr, nullptr, 0 });
+}
+
+/* The layout of the buffer range [lo, hi): the output segments (only
+ * settled ones when settled is set), the mirror between and after
+ * them, every piece cut at the block boundaries; the accumulation
+ * offsets pack the pieces of each lane. A buffer without segments is
+ * one mirror piece per block. */
+std::vector<hpiece> holder_layout(comm_state const & s, dev_view const & v,
+        size_t lo, size_t hi, size_t block_bytes, bool settled)
+{
+    bwc_dev_pieces const * const p = pieces_of(v.a);
+    if (!p)
+        holder_fail("the buffer arena has no piece records");
+    std::vector<bwc_dev_piece> segs;
+    if (!settled || p->out_settled)
+        segs.assign(p->out, p->out + p->nout);
+    std::sort(segs.begin(), segs.end(),
+            [](bwc_dev_piece const & x, bwc_dev_piece const & y) {
+                return x.off < y.off; });
+    int const ml = lane_of(s, v.device);
+    std::vector<hpiece> whole;
+    size_t at = lo;
+    for (bwc_dev_piece const & o : segs) {
+        if (o.off < v.off)
+            holder_fail("an output segment starts before the buffer");
+        size_t const base = o.off - v.off;
+        size_t const a = std::max(base, lo);
+        size_t const b = std::min(base + o.bytes, hi);
+        if (a >= b)
+            continue;
+        if (a < at)
+            holder_fail("the output segments overlap");
+        if (at < a)
+            mirror_piece(whole, p, v, at, a - at, ml);
+        whole.push_back({ a, b - a, lane_of(s, o.device), o.p + (a - base),
+                o.ready, o.owner, 0 });
+        at = b;
+    }
+    if (at < hi)
+        mirror_piece(whole, p, v, at, hi - at, ml);
+    std::vector<hpiece> L;
+    std::vector<size_t> packed(s.lanes.size(), 0);
+    for (hpiece q : whole) {
+        while (q.bytes) {
+            size_t const end = (q.off / block_bytes + 1) * block_bytes;
+            size_t const len = std::min(q.bytes, end - q.off);
+            hpiece x = q;
+            x.bytes = len;
+            x.acc = packed[x.lane];
+            packed[x.lane] += len;
+            L.push_back(x);
+            q.off += len;
+            q.src += len;
+            q.bytes -= len;
+        }
+    }
+    if (L.size() > HOLDER_MAX)
+        holder_fail("the layout passes HOLDER_MAX pieces");
+    return L;
+}
+
+hlayout wire_of(std::vector<hpiece> const & L)
+{
+    hlayout w {};
+    w.n = (int64_t) L.size();
+    for (size_t i = 0; i < L.size(); i++)
+        w.w[i] = { L[i].off, L[i].bytes, L[i].lane };
+    return w;
+}
+
+/* The overlaps of layouts A and C inside [lo, hi), in offset order. */
+std::vector<hcut> intersect(hlayout const & A, hlayout const & C,
+        size_t lo, size_t hi)
+{
+    std::vector<hcut> out;
+    int i = 0, j = 0;
+    while (i < A.n && j < C.n) {
+        size_t const a1 = A.w[i].off + A.w[i].bytes;
+        size_t const c1 = C.w[j].off + C.w[j].bytes;
+        size_t const x0 = std::max({ (size_t) A.w[i].off,
+                (size_t) C.w[j].off, lo });
+        size_t const x1 = std::min({ a1, c1, hi });
+        if (x0 < x1)
+            out.push_back({ x0, x1 - x0, i, j });
+        if (a1 < c1)
+            i++;
+        else
+            j++;
+    }
+    return out;
+}
+
+void wait_piece(cudaStream_t st, dev_view const & v, hpiece const & q)
+{
+    if (q.ready)
+        CUDA_CHECK(cudaStreamWaitEvent(st, q.ready, 0));
+    else
+        wait_range(st, v.a, v.off + q.off, q.bytes);
+}
+
+/* Free a lane area behind every read of it on the device. */
+void grow_behind(lane & l, uint8_t * & p, size_t & alloc, size_t want)
+{
+    if (alloc >= want)
+        return;
+    for (cudaStream_t st : { l.stream, l.copy, l.fan })
+        CUDA_CHECK(cudaStreamSynchronize(st));
+    for (cudaStream_t st : l.fans)
+        CUDA_CHECK(cudaStreamSynchronize(st));
+    for (bwc_dev_pieces const & r : l.stg)
+        for (int i = 0; i < r.nrd; i++)
+            CUDA_CHECK(cudaEventSynchronize(r.rd[i]));
+    grow(p, alloc, want);
+}
+
+/* The reduce-scatter of a device buffer along rs_steps, from the
+ * holders of the pieces. A rank sends its block pieces to the holders
+ * of the same ranges on the peer, and receives into the accumulation
+ * area of its own holders: the first receipt of a block into the area,
+ * XOR the own segment; a later receipt into htmp, XOR into the area.
+ * Then the result pieces of the own block go to block 0 of the mirror
+ * and become the output segments of the buffer. */
+void holder_rs(comm_state & s, dev_view const & v, size_t block_bytes)
+{
+    int const n = s.njobs, r = s.rank;
+    int const g = (int) s.lanes.size();
+    std::vector<hpiece> const L = holder_layout(s, v, 0,
+            (size_t) n * block_bytes, block_bytes, false);
+    if (s.nomirror)
+        pieces_of(v.a)->out_only = true;
+    hlayout const mine = wire_of(L);
+    std::vector<hlayout> lay(n);
+    MPI_Allgather(&mine, sizeof(hlayout), MPI_BYTE, lay.data(),
+            sizeof(hlayout), MPI_BYTE, s.mpi);
+    std::vector<std::vector<hop>> const steps = rs_steps(s);
+    size_t nhops = 0;
+    for (auto const & step : steps)
+        nhops = std::max(nhops, step.size());
+    std::vector<size_t> accb(g, 0);
+    for (hpiece const & q : L)
+        accb[q.lane] = std::max(accb[q.lane], q.acc + q.bytes);
+    for (int d = 0; d < g; d++) {
+        lane & l = s.lanes[d];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        fork(l, l.copy);
+        fresh_half(l);
+        grow_behind(l, l.acc[l.cur], l.acc_alloc[l.cur], accb[d]);
+        if (nhops > 1 || steps.size() > 1)
+            grow_behind(l, l.htmp, l.htmp_alloc, nhops * accb[d]);
+        tl_mark(tl, l.stream, l.device, "hr free", tl_k);
+    }
+    auto const acc_at = [&](hpiece const & q, size_t off) {
+        return (char *) s.lanes[q.lane].acc[s.lanes[q.lane].cur]
+            + q.acc + (off - q.off);
+    };
+    std::vector<char> accd(n, 0);
+    for (size_t i = 0; i < steps.size(); i++) {
+        std::vector<hop> const & step = steps[i];
+        for (hop const & h : step) {
+            if (accd[h.sblk])
+                continue;
+            for (hcut const & x : intersect(mine, lay[h.to],
+                        (size_t) h.sblk * block_bytes,
+                        (size_t) (h.sblk + 1) * block_bytes)) {
+                hpiece const & q = L[x.a];
+                lane & l = s.lanes[q.lane];
+                CUDA_CHECK(cudaSetDevice(l.device));
+                wait_piece(l.stream, v, q);
+            }
+        }
+        for (int d = 0; d < g; d++) {
+            lane & l = s.lanes[d];
+            CUDA_CHECK(cudaSetDevice(l.device));
+            tl_mark(tl, l.stream, l.device, tl_name("hr rdy", i), tl_k);
+        }
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t k = 0; k < step.size(); k++) {
+            hop const & h = step[k];
+            for (hcut const & x : intersect(mine, lay[h.to],
+                        (size_t) h.sblk * block_bytes,
+                        (size_t) (h.sblk + 1) * block_bytes)) {
+                hpiece const & q = L[x.a];
+                lane & l = s.lanes[q.lane];
+                CUDA_CHECK(cudaSetDevice(l.device));
+                char * const src = accd[h.sblk] ? acc_at(q, x.off)
+                    : q.src + (x.off - q.off);
+                NCCL_CHECK(ncclSend(src, x.bytes, ncclUint8,
+                            h.to * g + (int) lay[h.to].w[x.c].lane,
+                            l.hnccl, l.stream));
+            }
+            for (hcut const & x : intersect(lay[h.from], mine,
+                        (size_t) h.rblk * block_bytes,
+                        (size_t) (h.rblk + 1) * block_bytes)) {
+                hpiece const & q = L[x.c];
+                lane & l = s.lanes[q.lane];
+                CUDA_CHECK(cudaSetDevice(l.device));
+                char * const dst = !accd[h.rblk] && k == 0
+                    ? acc_at(q, x.off)
+                    : (char *) l.htmp + k * accb[q.lane] + q.acc
+                        + (x.off - q.off);
+                NCCL_CHECK(ncclRecv(dst, x.bytes, ncclUint8,
+                            h.from * g + (int) lay[h.from].w[x.a].lane,
+                            l.hnccl, l.stream));
+            }
+        }
+        NCCL_CHECK(ncclGroupEnd());
+        for (int d = 0; d < g; d++) {
+            lane & l = s.lanes[d];
+            CUDA_CHECK(cudaSetDevice(l.device));
+            tl_mark(tl, l.stream, l.device, tl_name("hr net", i), tl_k);
+        }
+        for (size_t k = 0; k < step.size(); k++) {
+            hop const & h = step[k];
+            size_t const lo = (size_t) h.rblk * block_bytes;
+            for (hpiece const & q : L) {
+                if (q.off < lo || q.off >= lo + block_bytes)
+                    continue;
+                lane & l = s.lanes[q.lane];
+                CUDA_CHECK(cudaSetDevice(l.device));
+                uint64_t * const a = (uint64_t *) acc_at(q, q.off);
+                if (!accd[h.rblk] && k == 0) {
+                    wait_piece(l.stream, v, q);
+                    comm_xor_gf2(a, (const uint64_t *) q.src,
+                            q.bytes / sizeof(uint64_t), l.stream);
+                } else {
+                    comm_xor_gf2(a, (const uint64_t *) ((char *) l.htmp
+                                + k * accb[q.lane] + q.acc),
+                            q.bytes / sizeof(uint64_t), l.stream);
+                }
+            }
+        }
+        for (hop const & h : step)
+            accd[h.rblk] = 1;
+        for (int d = 0; d < g; d++) {
+            lane & l = s.lanes[d];
+            CUDA_CHECK(cudaSetDevice(l.device));
+            tl_mark(tl, l.stream, l.device, tl_name("hr xor", i), tl_k);
+        }
+    }
+    int const ml = lane_of(s, v.device);
+    for (int d = 0; d < g; d++) {
+        lane & l = s.lanes[d];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        CUDA_CHECK(cudaEventRecord(l.done, l.stream));
+        CUDA_CHECK(cudaEventRecord(l.rd[0], l.stream));
+    }
+    for (hpiece const & q : L)
+        if (q.owner)
+            reader(q.owner, s.lanes[q.lane].rd[0]);
+    /* the mirror writes of block 0 follow the mirror reads of the
+     * mirror lane and the XOR of their own lane */
+    for (int d = 0; d < g; d++) {
+        lane & l = s.lanes[d];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        fork(l, l.copy);
+        CUDA_CHECK(cudaStreamWaitEvent(l.copy, s.lanes[ml].done, 0));
+    }
+    size_t const own = (size_t) r * block_bytes;
+    for (hpiece const & q : L) {
+        if (q.off < own || q.off >= own + block_bytes)
+            continue;
+        lane & l = s.lanes[q.lane];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        size_t const x = q.off - own;
+        wait_range(l.copy, v.a, v.off + x, q.bytes);
+    }
+    for (int d = 0; d < g; d++) {
+        lane & l = s.lanes[d];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        tl_mark(tl, l.copy, l.device, "hr mir0", tl_k);
+    }
+    for (hpiece const & q : L) {
+        if (q.off < own || q.off >= own + block_bytes)
+            continue;
+        lane & l = s.lanes[q.lane];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        size_t const x = q.off - own;
+        CUDA_CHECK(cudaMemcpyPeerAsync(v.p + x, v.device, acc_at(q, q.off),
+                    l.device, q.bytes, l.copy));
+    }
+    for (int d = 0; d < g; d++) {
+        lane & l = s.lanes[d];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        CUDA_CHECK(cudaEventRecord(l.mir, l.copy));
+        tl_mark(tl, l.copy, l.device, "hr out", tl_k);
+    }
+    bwc_dev_stale_clear(pieces_of(v.a), v.off, block_bytes);
+    join_lanes(s);
+    for (lane & l : s.lanes)
+        CUDA_CHECK(cudaStreamWaitEvent(s.pub, l.mir, 0));
+    publish(s, v.a);
+    bwc_dev_pieces * const p = pieces_of(v.a);
+    p->nout = 0;
+    for (hpiece const & q : L) {
+        if (q.off < own || q.off >= own + block_bytes)
+            continue;
+        if (p->nout == BWC_DEV_PIECES_MAX)
+            holder_fail("the result pieces pass BWC_DEV_PIECES_MAX");
+        lane & l = s.lanes[q.lane];
+        p->out[p->nout++] = { l.device, acc_at(q, q.off),
+            v.off + (q.off - own), q.bytes, l.done, &l.stg[l.cur] };
+    }
+    p->out_settled = true;
+    p->out_before = nullptr;
+    p->out_end = v.off + block_bytes;
+    p->wgen++;
+    tl_mark(tl, s.pub, s.lanes[0].device, "hr pub", tl_k);
+}
+
+/* The destination of an allgather piece on lane d: the replica on the
+ * lane device, or the mirror when the device holds it; without
+ * replicas, the mirror on its own lane and agtmp on the others. */
+char * holder_dst(comm_state const & s, dev_view const & v,
+        bwc_dev_pieces const * reps, int d, size_t off, size_t bytes,
+        size_t agoff)
+{
+    lane const & l = s.lanes[d];
+    if (reps) {
+        for (int k = 0; k < reps->nrep; k++) {
+            bwc_dev_piece const & rp = reps->rep[k];
+            if (rp.device != l.device)
+                continue;
+            if (v.off + off < rp.off || rp.off + rp.bytes < v.off + off + bytes)
+                holder_fail("a replica does not cover an allgather piece");
+            return rp.p + (v.off + off - rp.off);
+        }
+    }
+    if (l.device == v.device)
+        return v.p + off;
+    if (reps)
+        holder_fail("a lane device holds neither a replica nor the mirror");
+    return (char *) l.agtmp + agoff;
+}
+
+/* The fan-out stream of a lane that writes the copy on a device: the
+ * stream of its replica, or of the mirror when the device holds none. */
+int fan_of(bwc_dev_pieces const * reps, int device)
+{
+    for (int k = 0; reps && k < reps->nrep; k++)
+        if (reps->rep[k].device == device)
+            return k + 1;
+    return 0;
+}
+
+/* A piece of an allgather block, cut at the quarter boundaries of the
+ * block: the holder lane of the piece on the rank of the block, the
+ * quarter lane, the index of the piece in the block layout, and its
+ * offset in the agtmp area of the quarter lane. */
+struct hsub {
+    size_t off, bytes;
+    int from, to;
+    size_t k;
+    size_t agoff;
+};
+
+/* A write of the allgather on fan-out stream fan of lane: the arena
+ * range [off, off + bytes) of the replica on device (-1: the mirror). */
+struct hwrite {
+    int lane;
+    size_t fan;
+    int device;
+    size_t off, bytes;
+};
+
+/* The device of the memory holder_dst gives on lane d, -1 for the
+ * mirror, -2 for the lane scratch. */
+int dst_device(comm_state const & s, dev_view const & v,
+        bwc_dev_pieces const * reps, int d)
+{
+    int const device = s.lanes[d].device;
+    if (fan_of(reps, device))
+        return device;
+    return device == v.device ? -1 : -2;
+}
+
+cudaEvent_t wb_event(band_store & bs, size_t d, size_t i)
+{
+    if (bs.wbev.size() <= d)
+        bs.wbev.resize(d + 1);
+    while (bs.wbev[d].size() <= i) {
+        cudaEvent_t wev;
+        CUDA_CHECK(cudaEventCreateWithFlags(&wev, cudaEventDisableTiming));
+        bs.wbev[d].push_back(wev);
+    }
+    return bs.wbev[d][i];
+}
+
+/* The allgather of a device buffer along ag_steps. The ranks swap the
+ * layouts of their own blocks (the settled output segments, which after
+ * a holder reduce-scatter are its result pieces, and the mirror for the
+ * rest), and every piece is cut at the g quarters of its block. The
+ * holder sends quarter j of its block to lane j of the peer, and a lane
+ * forwards the quarters it holds on the same lane. A received quarter
+ * lands in the replica or the mirror of its lane device, and the lane
+ * copies it to the mirror and the other replicas. The own block takes
+ * two hops: each holder copies quarter j to the replica of lane j, and
+ * lane j copies it on to the other replicas. So every lane fans out
+ * about one quarter, whichever lane holds the rows. */
+void holder_ag(comm_state & s, dev_view const & v, size_t block_bytes,
+        band_store & bs)
+{
+    int const n = s.njobs, r = s.rank;
+    int const g = (int) s.lanes.size();
+    bwc_dev_pieces const * const reps =
+        replicas_of(v, (size_t) n * block_bytes);
+    size_t const own_off = (size_t) r * block_bytes;
+    std::vector<hpiece> const own = holder_layout(s, v, own_off,
+            own_off + block_bytes, block_bytes, true);
+    hlayout const mine = wire_of(own);
+    std::vector<hlayout> lay(n);
+    MPI_Allgather(&mine, sizeof(hlayout), MPI_BYTE, lay.data(),
+            sizeof(hlayout), MPI_BYTE, s.mpi);
+    size_t const qb = block_bytes / (size_t) g / sizeof(uint64_t)
+        * sizeof(uint64_t);
+    std::vector<std::vector<hsub>> sub(n);
+    std::vector<size_t> agb(g, 0);
+    for (int b = 0; b < n; b++) {
+        size_t const b0 = (size_t) b * block_bytes;
+        for (int64_t i = 0; i < lay[b].n; i++) {
+            hwire const & w = lay[b].w[i];
+            if (w.off / block_bytes != (uint64_t) b || w.lane < 0 || w.lane >= g)
+                holder_fail("an allgather layout piece is outside its block or lanes");
+            for (int j = 0; j < g; j++) {
+                size_t const lo = std::max((size_t) w.off, b0 + (size_t) j * qb);
+                size_t const hi = std::min((size_t) (w.off + w.bytes),
+                        j == g - 1 ? b0 + block_bytes : b0 + (size_t) (j + 1) * qb);
+                if (lo >= hi)
+                    continue;
+                sub[b].push_back({ lo, hi - lo, (int) w.lane, j, (size_t) i, agb[j] });
+                if (b != r)
+                    agb[j] += hi - lo;
+            }
+        }
+    }
+    /* the lane that fans out quarter x of the own block: the quarter
+     * lane when its device holds a replica, else the holder */
+    auto const route = [&](hsub const & x) {
+        return reps && fan_of(reps, s.lanes[x.to].device) ? x.to : x.from;
+    };
+    bool const wbands = s.wbands && reps;
+    std::vector<hwrite> pend;
+    std::vector<bwc_dev_piece> wb;
+    std::vector<size_t> wbi(g, 0);
+    auto const note = [&](int d, size_t fan, int device, size_t off,
+            size_t bytes) {
+        if (wbands && device != -2)
+            pend.push_back({ d, fan, device, v.off + off, bytes });
+    };
+    /* the copies of [off, off + bytes) from got on lane d to the replicas */
+    auto const note_reps = [&](int d, size_t off, size_t bytes,
+            const char * got) {
+        for (int q = 0; wbands && q < reps->nrep; q++) {
+            bwc_dev_piece const & rp = reps->rep[q];
+            size_t const lo = std::max(v.off + off, rp.off);
+            size_t const hi = std::min(v.off + off + bytes, rp.off + rp.bytes);
+            if (lo < hi && (!got || rp.p + (lo - rp.off) != got + (lo - v.off - off)))
+                note(d, (size_t) q + 1, rp.device, lo - v.off, hi - lo);
+        }
+    };
+    /* one event per fan-out stream of lane d behind the writes noted
+     * on it since the last records of the lane */
+    auto const record = [&](int d) {
+        lane & l = s.lanes[d];
+        for (size_t k = 0; wbands && k < l.fans.size(); k++) {
+            cudaEvent_t wev = nullptr;
+            for (hwrite const & w : pend) {
+                if (w.lane != d || w.fan != k)
+                    continue;
+                if (!wev) {
+                    wev = wb_event(bs, (size_t) d, wbi[d]++);
+                    CUDA_CHECK(cudaEventRecord(wev, l.fans[k]));
+                }
+                wb.push_back({ w.device, nullptr, w.off, w.bytes, wev, nullptr });
+            }
+        }
+        pend.erase(std::remove_if(pend.begin(), pend.end(),
+                    [d](hwrite const & w) { return w.lane == d; }), pend.end());
+    };
+    for (int d = 0; d < g; d++) {
+        lane & l = s.lanes[d];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        if (!reps) {
+            CUDA_CHECK(cudaStreamWaitEvent(l.stream, l.fanned[0], 0));
+            CUDA_CHECK(cudaStreamWaitEvent(l.stream, l.fanned[1], 0));
+            grow_behind(l, l.agtmp, l.agtmp_alloc, agb[d]);
+        }
+        wait_before(l.stream, v.a, v.off + own_off, block_bytes);
+        for (int k = 0; reps && k < reps->nrep; k++)
+            CUDA_CHECK(cudaStreamWaitEvent(l.stream, reps->rep[k].ready, 0));
+        for (hpiece const & q : own)
+            if (q.lane == d)
+                wait_piece(l.stream, v, q);
+        fork_fans(l);
+        for (size_t k = 0; k < l.fans.size(); k++)
+            tl_mark(tl, l.fans[k], l.device, tl_name("ha o1s f", (int) k), tl_k);
+        for (hsub const & x : sub[r]) {
+            if (x.from != d)
+                continue;
+            hpiece const & q = own[x.k];
+            const uint8_t * const src = (const uint8_t *) q.src + (x.off - q.off);
+            if (route(x) == d) {
+                replicas_out(l, v, reps, x.off, x.bytes, src);
+                note_reps(d, x.off, x.bytes, nullptr);
+                continue;
+            }
+            lane const & to = s.lanes[x.to];
+            CUDA_CHECK(cudaMemcpyPeerAsync(
+                        holder_dst(s, v, reps, x.to, x.off, x.bytes, 0),
+                        to.device, src, l.device, x.bytes,
+                        l.fans[fan_of(reps, to.device)]));
+            note(d, (size_t) fan_of(reps, to.device),
+                    dst_device(s, v, reps, x.to), x.off, x.bytes);
+        }
+        record(d);
+        for (size_t k = 0; k < l.fans.size(); k++) {
+            CUDA_CHECK(cudaEventRecord(l.fanev[k], l.fans[k]));
+            tl_mark(tl, l.fans[k], l.device, tl_name("ha o1e f", (int) k), tl_k);
+        }
+    }
+    for (int d = 0; d < g; d++) {
+        lane & l = s.lanes[d];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        std::vector<char> from(g, 0);
+        for (hsub const & x : sub[r])
+            if (x.to == d && x.from != d && route(x) == d)
+                from[x.from] = 1;
+        for (int e = 0; e < g; e++) {
+            if (!from[e])
+                continue;
+            cudaEvent_t const ev = s.lanes[e].fanev[fan_of(reps, l.device)];
+            for (cudaStream_t f : l.fans)
+                CUDA_CHECK(cudaStreamWaitEvent(f, ev, 0));
+        }
+        for (size_t k = 0; k < l.fans.size(); k++)
+            tl_mark(tl, l.fans[k], l.device, tl_name("ha o2s f", (int) k), tl_k);
+    }
+    for (int d = 0; d < g; d++) {
+        lane & l = s.lanes[d];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        for (hsub const & x : sub[r]) {
+            if (x.to != d || x.from == d || route(x) != d)
+                continue;
+            char * const got = holder_dst(s, v, reps, d, x.off, x.bytes, 0);
+            for (int q = 0; q < reps->nrep; q++) {
+                bwc_dev_piece const & rp = reps->rep[q];
+                char * const to = rp.p + (v.off + x.off - rp.off);
+                if (to == got)
+                    continue;
+                CUDA_CHECK(cudaMemcpyPeerAsync(to, rp.device, got,
+                            l.device, x.bytes, l.fans[q + 1]));
+            }
+            note_reps(d, x.off, x.bytes, got);
+        }
+        record(d);
+        for (size_t k = 0; k < l.fans.size(); k++)
+            tl_mark(tl, l.fans[k], l.device, tl_name("ha o2e f", (int) k), tl_k);
+        join_fans(l, l.fan);
+        CUDA_CHECK(cudaEventRecord(l.blk[r], l.fan));
+        tl_mark(tl, l.fan, l.device, "ha own", tl_k);
+    }
+    std::vector<size_t> ds(g);
+    for (int d = 0; d < g; d++)
+        ds[d] = (size_t) d;
+    if (v.a->ready)
+        CUDA_CHECK(cudaStreamWaitEvent(s.pub, (cudaEvent_t) v.a->ready, 0));
+    band_ready(s, ds, bs, r);
+    std::vector<std::vector<hop>> const steps = ag_steps(s);
+    for (size_t i = 0; i < steps.size(); i++) {
+        std::vector<hop> const & step = steps[i];
+        NCCL_CHECK(ncclGroupStart());
+        for (hop const & h : step) {
+            for (hsub const & x : sub[h.sblk]) {
+                bool const mine_blk = h.sblk == r;
+                lane & l = s.lanes[mine_blk ? x.from : x.to];
+                CUDA_CHECK(cudaSetDevice(l.device));
+                char * const src = mine_blk
+                    ? own[x.k].src + (x.off - own[x.k].off)
+                    : holder_dst(s, v, reps, x.to, x.off, x.bytes, x.agoff);
+                NCCL_CHECK(ncclSend(src, x.bytes, ncclUint8,
+                            h.to * g + x.to, l.hnccl, l.stream));
+            }
+            for (hsub const & x : sub[h.rblk]) {
+                lane & l = s.lanes[x.to];
+                CUDA_CHECK(cudaSetDevice(l.device));
+                int const peer = h.from == h.rblk ? x.from : x.to;
+                NCCL_CHECK(ncclRecv(holder_dst(s, v, reps, x.to,
+                                x.off, x.bytes, x.agoff),
+                            x.bytes, ncclUint8, h.from * g + peer,
+                            l.hnccl, l.stream));
+            }
+        }
+        NCCL_CHECK(ncclGroupEnd());
+        for (int d = 0; d < g; d++) {
+            lane & l = s.lanes[d];
+            CUDA_CHECK(cudaSetDevice(l.device));
+            tl_mark(tl, l.stream, l.device, tl_name("ha net", i), tl_k);
+            fork_fans(l);
+            for (size_t k = 0; k < l.fans.size(); k++)
+                tl_mark(tl, l.fans[k], l.device, tl_name(
+                            ("ha b" + std::to_string(i) + "s f").c_str(),
+                            (int) k), tl_k);
+            for (hop const & h : step) {
+                for (hsub const & x : sub[h.rblk]) {
+                    if (x.to != d)
+                        continue;
+                    const uint8_t * const got = (const uint8_t *) holder_dst(
+                            s, v, reps, d, x.off, x.bytes, x.agoff);
+                    note(d, (size_t) fan_of(reps, l.device),
+                            dst_device(s, v, reps, d), x.off, x.bytes);
+                    if (got != (const uint8_t *) v.p + x.off) {
+                        CUDA_CHECK(cudaMemcpyPeerAsync(v.p + x.off, v.device,
+                                    got, l.device, x.bytes, l.fans[0]));
+                        note(d, 0, -1, x.off, x.bytes);
+                    }
+                    for (int q = 0; reps && q < reps->nrep; q++) {
+                        bwc_dev_piece const & rp = reps->rep[q];
+                        char * const to = rp.p + (v.off + x.off - rp.off);
+                        if ((const uint8_t *) to == got)
+                            continue;
+                        CUDA_CHECK(cudaMemcpyPeerAsync(to, rp.device, got,
+                                    l.device, x.bytes, l.fans[q + 1]));
+                    }
+                    if (reps)
+                        note_reps(d, x.off, x.bytes, (const char *) got);
+                }
+            }
+            record(d);
+            for (size_t k = 0; k < l.fans.size(); k++)
+                tl_mark(tl, l.fans[k], l.device, tl_name(
+                            ("ha b" + std::to_string(i) + "e f").c_str(),
+                            (int) k), tl_k);
+            join_fans(l, l.fan);
+            for (hop const & h : step) {
+                CUDA_CHECK(cudaEventRecord(l.blk[h.rblk], l.fan));
+                tl_mark(tl, l.fan, l.device, tl_name("ha blk", h.rblk), tl_k);
+            }
+        }
+        for (hop const & h : step)
+            band_ready(s, ds, bs, h.rblk);
+    }
+    for (int b = 0; b < n; b++)
+        if (b != r)
+            bwc_dev_stale_clear(pieces_of(v.a),
+                    v.off + (size_t) b * block_bytes, block_bytes);
+    for (int d = 0; d < g; d++) {
+        lane & l = s.lanes[d];
+        CUDA_CHECK(cudaSetDevice(l.device));
+        CUDA_CHECK(cudaEventRecord(l.rd[1], l.stream));
+        CUDA_CHECK(cudaEventRecord(l.fanned[l.cur], l.fan));
+    }
+    for (hpiece const & q : own)
+        if (q.owner)
+            reader(q.owner, s.lanes[q.lane].rd[1]);
+    publish(s, v.a);
+    written(v, reps != nullptr);
+    if (wbands) {
+        bwc_dev_pieces * const p = pieces_of(v.a);
+        if (wb.size() > BWC_DEV_WBANDS_MAX)
+            holder_fail("the allgather writes more pieces than the write records hold");
+        std::copy(wb.begin(), wb.end(), p->wb);
+        p->nwb = (int) wb.size();
+        p->wb_wgen = p->wgen;
+    }
+    tl_mark(tl, s.pub, s.lanes[0].device, "ha pub", tl_k);
+    if (v.off == 0) {
+        for (int b = 0; b < n; b++)
+            bs.bands[b] = { (size_t) b * block_bytes, block_bytes, bs.ev[b] };
+        v.a->bands = bs.bands.data();
+        v.a->nbands = n;
+    }
+}
+
+/* Under BWC_NCCL_HOLDER, the host buffers of the program start (the
+ * communication benchmark and the broadcasts of the loaded vectors)
+ * take the host staging, and the plugin says so once per leg; a host
+ * buffer after the first holder exchange aborts. */
+void holder_host(comm_state const & s, const char * leg)
+{
+    static bool said[2];
+    int const i = leg[0] == 'a';
+    if (!s.holder)
+        return;
+    if (s.holder_started) {
+        fprintf(stderr, "bwccomm_nccl: BWC_NCCL_HOLDER: a host buffer of the"
+                " %s after the holder exchange started\n", leg);
+        abort();
+    }
+    if (said[i])
+        return;
+    said[i] = true;
+    fprintf(stderr, "bwccomm_nccl: BWC_NCCL_HOLDER: a host buffer of the %s"
+            " takes the host staging\n", leg);
+}
+
 /* Reduce-scatter over the lanes, along rs_steps. The lane stages its
  * slice of the blocks on its copy stream, in the order the ring
  * consumes them, with one block event each; the lane stream waits for
@@ -732,6 +1554,13 @@ void reduce_scatter_xor(void * const * bufs, int nbufs,
     std::vector<std::vector<hop>> const steps = rs_steps(s);
     for (int w = 0; w < nbufs; w++) {
         dev_view const v = dev_of(bufs[w]);
+        if (s.holder && v.p) {
+            s.holder_started = true;
+            holder_rs(s, v, block_bytes);
+            continue;
+        }
+        if (!v.p)
+            holder_host(s, "reduce-scatter");
         if (v.p)
             request_order(v, n, block_bytes, blk_at);
         for (size_t d : ds) {
@@ -867,6 +1696,13 @@ void allgather(void * const * bufs, int nbufs,
     for (int w = 0; w < nbufs; w++) {
         dev_view const v = dev_of(bufs[w]);
         band_store * const bs = v.p ? &store_of(s, v.a) : nullptr;
+        if (s.holder && v.p) {
+            s.holder_started = true;
+            holder_ag(s, v, block_bytes, *bs);
+            continue;
+        }
+        if (!v.p)
+            holder_host(s, "allgather");
         bwc_dev_pieces const * const reps =
             replicas_of(v, (size_t) n * block_bytes);
         for (size_t d : ds) {

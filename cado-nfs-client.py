@@ -1167,6 +1167,9 @@ class InputDownloader(object):
                 close_exclusive(fileobj)
         self.wu_backlog = []
         self.wu_backlog_alt = []
+        # dlpath -> file_state of each companion file that get_files
+        # has verified.
+        self.verified = {}
         self.exit_on_server_gone = self.settings["EXIT_ON_SERVER_GONE"]
 
     # {{{ download -- this goes through several steps.
@@ -1491,13 +1494,57 @@ class InputDownloader(object):
             # downloads its own copy and renames it over the shared
             # file, and a sieve process that reads the replaced file
             # on a network file system fails with "Stale file handle".
-            with open(dlpath + ".lock", "w") as lockfile:
-                FileLock.lock(lockfile, exclusive=True)
-                self.get_missing_file(urlpath, dlpath, checksum,
-                                      executable=fid.startswith('EXECFILE'),
-                                      mandatory_server=server)
+            #
+            # Only a download takes the exclusive lock. Clients verify
+            # an existing file under the shared lock, all at the same
+            # time, and a client verifies an unchanged file only once.
+            state = self.file_state(dlpath, checksum)
+            if state is not None and self.verified.get(dlpath) == state:
+                continue
+            # On NFS a shared flock needs a handle open for reading and
+            # an exclusive flock needs one open for writing.
+            # No client replaces the file while another one holds the
+            # lock, so the state read under the lock is the state of
+            # the file that was verified.
+            with open(dlpath + ".lock", "a+") as lockfile:
+                FileLock.lock(lockfile)
+                present = self.has_checksum(dlpath, checksum)
+                state = self.file_state(dlpath, checksum)
                 FileLock.unlock(lockfile)
+                if not present:
+                    FileLock.lock(lockfile, exclusive=True)
+                    self.get_missing_file(
+                        urlpath, dlpath, checksum,
+                        executable=fid.startswith('EXECFILE'),
+                        mandatory_server=server)
+                    state = self.file_state(dlpath, checksum)
+                    FileLock.unlock(lockfile)
+            self.verified[dlpath] = state
         return True
+
+    @staticmethod
+    def file_state(filename, checksum):
+        """ What identifies a verified file: the checksum that the
+        workunit asks for, and the size and modification time of the
+        file. None if the file does not exist.
+        """
+        try:
+            st = os.stat(filename)
+        except FileNotFoundError:
+            return None
+        return (checksum, st.st_size, st.st_mtime_ns)
+
+    def has_checksum(self, filename, checksum):
+        """ True if the file exists and has this checksum. A checksum
+        of None (NOSHA1CHECK) accepts any existing file.
+        """
+        if not os.path.isfile(filename):
+            return False
+        if checksum is None \
+                or self.do_checksum(filename).lower() == checksum.lower():
+            logging.info("%s already exists, not downloading", filename)
+            return True
+        return False
 
     # }}}
 

@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -29,6 +30,17 @@ inline bool env_flag(char const * name, bool dflt)
 {
     char const * v = std::getenv(name);
     return v ? std::strcmp(v, "0") != 0 : dflt;
+}
+
+/* Run f(0), ..., f(n - 1) on n threads and wait for all of them. */
+template <typename F>
+void run_threads(unsigned n, F && f)
+{
+    std::vector<std::thread> threads;
+    for (unsigned t = 0; t < n; t++)
+        threads.emplace_back([&f, t] { f(t); });
+    for (std::thread & th : threads)
+        th.join();
 }
 
 /* GPU-hole diagnosis (active with GLAS_GPU_STATS): each siever thread
@@ -237,8 +249,12 @@ sieve_result sieve_one_cpu(sq_task const & task,
 using chunk_result = std::function<sieve_result()>;
 using chunk_sink = std::function<void(chunk_result &&)>;
 void gpu_warmup();
-bool gpu_init(std::vector<fb_entry> const * fb, int logI, uint32_t max_J,
-              tiny_table const & tt, filter_params const & fp);
+/* Builds the host copy of the device factor-base tables with the given
+ * number of threads.  It needs no CUDA context, so main can run it
+ * while gpu_warmup creates the context; gpu_init uploads the tables. */
+void gpu_prepare(std::vector<fb_entry> const * fb, int logI, unsigned threads);
+bool gpu_init(int logI, uint32_t max_J, tiny_table const & tt,
+              filter_params const & fp);
 int gpu_slots();
 void sieve_one_gpu(sq_task const & task, std::vector<fb_entry> const * fb,
                    tiny_table const & tt, chunk_sink const & sink);

@@ -112,7 +112,8 @@ struct v_prefetch {
     }
 
     /* the pieces of block s0 into the own ranges of vi, then the
-     * vectors complete on every rank, as after mmt_vec_load */
+     * vectors complete on every rank, as after mmt_vec_load, and on
+     * the device, so that the twist of the block runs there */
     void place(unsigned int s0)
     {
         ASSERT_ALWAYS(s0 == s);
@@ -127,6 +128,7 @@ struct v_prefetch {
             mmt_vec_dev_invalidate(v);
             v.consistency = 1;
             mmt_vec_broadcast(v);
+            mmt_vec_dev_adopt(v);
             v.pi.m.serialize_threads(__FILE__, __LINE__);
         }
         if (M.tcan_print)
@@ -153,17 +155,22 @@ static void dev_combine(mksol_state & M, mmt_vec & y, unsigned int c)
     wr.serialize_threads(__FILE__, __LINE__);
 }
 
-/* One product of the zero vector: the matmul backend creates the device
- * mirrors of both iterates on their first product, and the combine that
- * precedes the first real product then runs on the device too. */
+/* Two products of the zero vector: the matmul backend creates the
+ * device mirror of an iterate on its first product as a source, and the
+ * combines that precede the first real products then run on the device
+ * too. The V vectors get their mirrors next to the iterate, so that
+ * every block places them on the device (see v_prefetch::place). */
 static void warm_up(mksol_state & M, mmt_vector_pair & other)
 {
     mmt_full_vec_set_zero(M.ymy[0]);
     M.pi.interleaving_flip();
     matmul_top_mul_to(M.mmt, M.ymy.vectors(), other[0], nullptr);
+    matmul_top_mul_to(M.mmt, other.vectors(), M.ymy[0], nullptr);
     M.pi.interleaving_flip();
     M.pi.interleaving_flip();
     M.pi.m.serialize(__FILE__, __LINE__);
+    for(mmt_vec & v : M.vi)
+        mmt_vec_dev_mirror(v, M.ymy[0]);
 }
 
 /* The S file of a block, gathered and written while the next block
@@ -242,21 +249,29 @@ static void * gmksol_prog(parallelizing_info & pi, cxx_param_list & pl, void * a
         V.start(bw->start);
     epoch_timer epoch;
     for(unsigned int s = bw->start ; s < M.end ; s += bw->checkpoint_precious) {
+        epoch_timer it;
+        double t_place = 0, t_twist = 0;
         if (M.fake) {
             M.load(s);
         } else {
             V.place(s);
+            t_place = it.lap();
             M.begin_block(s);
+            t_twist = it.lap();
             if (s + bw->checkpoint_precious < M.end)
                 V.start(s + bw->checkpoint_precious);
         }
-        epoch_timer it;
+        it.lap();
         mmt_vec & y = M.iterate(s, other, dev_combine, "gmksol");
         double const t_iter = it.lap();
         if (!M.fake)
             S.output(s, y);
+        double const t_stage = it.lap();
         epoch_report(M.tcan_print, "gmksol", M.block_end, M.block_end - s,
                 t_iter, epoch.lap() - t_iter);
+        if (M.tcan_print)
+            fmt::print("gmksol block {}: V place {:.3f} s, twist {:.3f} s, S stage {:.3f} s\n",
+                    s, t_place, t_twist, t_stage);
     }
 
     M.finish("gmksol");

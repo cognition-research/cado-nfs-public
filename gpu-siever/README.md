@@ -6,7 +6,7 @@ GPU implementations of: lattice sieving, polynomial selection,
 and block Wiedemann. The programs build against
 the CADO-NFS tree in the parent directory, which is modified for compatibility.
 
-This is the `rsa260` version.
+This is the `latest` version.
 
 ## Contents
 
