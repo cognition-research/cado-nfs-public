@@ -1,0 +1,178 @@
+#include "cado.h" // IWYU pragma: keep
+
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+
+#include <list>
+#include <sstream>
+#include <utility>
+#include <vector>
+
+#include <gmp.h>
+#include "fmt/base.h"
+
+#include "batch.hpp"
+#include "cado_poly.hpp"
+#include "cxx_mpz.hpp"
+#include "gzip.h"
+#include "las-side-config.hpp"
+#include "special-q.hpp"
+#include "macros.h"
+#include "memusage.h"
+#include "mpz_poly.h"
+#include "params.hpp"
+#include "relation.hpp"
+#include "verbose.hpp"
+
+static void declare_usage(cxx_param_list & pl)
+{
+    pl.declare_usage("in", "input file");
+    pl.declare_usage("poly", "poly file");
+    pl.declare_usage("t", "number of threads");
+    siever_side_config::declare_usage(pl);
+    batch_side_config::declare_usage(pl);
+    pl.declare_usage("doecm", "finish with ECM [default = no]");
+    pl.declare_usage("dont_recomp_norm", "given integers are the norms themselves (w/ sq) [default = no]");
+    pl.declare_usage("ncurves", "number of curves to be used in ECM [default = 50]");
+
+    verbose_decl_usage(pl);
+}
+
+// coverity[root_function]
+int
+main (int argc, char const *argv[])
+{
+  cxx_param_list pl;
+  cxx_cado_poly cpoly;
+  unsigned long nb_threads = 1;
+  int doecm = 0;
+  int no_recomp_norm = 0;
+  int const ncurves = 50;
+
+  declare_usage(pl);
+
+  pl.configure_switch_old("-doecm", &doecm);
+  pl.configure_switch_old("-dont_recomp_norm", &no_recomp_norm);
+
+  pl.process_command_line_and_extra_parameter_files(argc, argv);
+
+  verbose_interpret_parameters(pl);
+  pl.print_command_line(stdout);
+
+  const char * filename;
+  if ((filename = pl.lookup_old("poly")) == NULL)
+      pl.fail("Error: parameter -poly is mandatory\n");
+  if (!cpoly.read(filename))
+      pl.fail("Error reading polynomial file %s\n", filename);
+
+  const char * infilename;
+  if ((infilename = pl.lookup_old("in")) == NULL)
+      pl.fail("Error: parameter -in is mandatory\n");
+  pl.parse("t", nb_threads);
+  
+  int const nsides = cpoly.nsides();
+
+  std::vector<siever_side_config> sides;
+  siever_side_config::parse(pl, sides, nsides, { "lpb", "mfb" });
+
+  std::vector<batch_side_config> bsides;
+  batch_side_config::parse(pl, bsides, nsides, { "batchlpb", "batchmfb" });
+
+  std::vector<cxx_mpz> batchP;
+
+  double extra_time = 0;
+
+  auto lpb = siever_side_config::collect_lpb(sides);
+  auto batchlpb = batch_side_config::collect_batchlpb(bsides);
+  auto batchmfb = batch_side_config::collect_batchmfb(bsides);
+
+  for (int side = 0; side < 2; ++side) {
+      batchP.push_back(0);
+      create_batch_file (bsides[side].batchfilename,
+              batchP[side],
+              sides[side].lim,
+              1UL << bsides[side].batchlpb,
+              cpoly[side],
+              stdout,
+              nb_threads,
+              extra_time);
+  }
+
+  // Read list from the input file.
+  std::list<std::pair<special_q, std::list<cofac_candidate>>> List;
+  FILE * inp = fopen_maybe_compressed(infilename, "r");
+  ASSERT_ALWAYS(inp);
+
+#define MAX_SIZE 2048
+  char str[MAX_SIZE];
+
+  // If the special-q info is present, we will use it. Otherwise, the
+  // fake sq will be used everywhere. This list keeps in memory all the
+  // special q encountered.
+  // Create a fake special-q
+  special_q sq(1, 1, 0);
+
+  long a;
+  unsigned long b;
+  std::list<cofac_candidate> for_this_q;
+
+  for(int lnum = 0; fgets(str, MAX_SIZE, inp) ; lnum++) {
+      cxx_mpz q;
+      if (str[0] == '#') {
+          cxx_mpz r;
+          int side;
+          int const ret = gmp_sscanf(str, "# q = (%Zd, %Zd, %d)",
+                  &q, &r, &side);
+          if (ret == 3) {
+              if (!for_this_q.empty())
+                  List.emplace_back(sq, std::move(for_this_q));
+              for_this_q.clear();
+              /* make sure we don't try to factor q */
+              const std::vector<uint64_t> primes { uint64_t(q) };
+              sq = special_q(q, r, side, primes);
+          }
+          continue;
+      }
+      std::vector<cxx_mpz> norms(nsides, 0);
+      std::istringstream ss(str);
+      ss >> a >> b;
+      for(int side = 0 ; side < nsides ; side++)
+          ss >> norms[side];
+      if (!ss) {
+          fprintf(stderr, "parse error at line %d in cofactor input file\n", lnum);
+          exit(EXIT_FAILURE);
+      }
+      for_this_q.emplace_back(a, b, norms);
+  }
+  if (!for_this_q.empty())
+      List.emplace_back(sq, std::move(for_this_q));
+  fclose_maybe_compressed(inp, infilename);
+
+  find_smooth(List, batchP, batchlpb, lpb, batchmfb, stdout, nb_threads, extra_time);
+  
+  if (doecm) {
+      for(auto const & lq : List) {
+          fmt::print("# {}\n", lq.first);
+          std::list<relation> const smooth = factor(lq.second, cpoly, lq.first, batchlpb, lpb, ncurves, stdout, nb_threads, extra_time, !no_recomp_norm);
+          for(auto const & rel : smooth)
+              fmt::print("{}\n", rel);
+      }
+  } else {
+      for (auto const & lq : List) {
+          for (auto const & x : lq.second) {
+              fmt::print("{} {} {}\n",
+                      x.a, x.b,
+                      join(x.cofactor, " "));
+          }
+      }
+  }
+
+    const size_t peakmem = PeakMemusage();
+    if (peakmem > 0)
+        printf ("# PeakMemusage (MB) = %zu \n",
+                peakmem >> 10);
+
+  return EXIT_SUCCESS;
+}

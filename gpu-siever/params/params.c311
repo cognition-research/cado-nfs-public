@@ -1,0 +1,35 @@
+name = c311
+
+tasks.polyselect.degree = 6
+tasks.polyselect.P = 10000000
+tasks.polyselect.admax = 4e7
+tasks.polyselect.adrange = 5e3
+tasks.polyselect.incr = 60
+tasks.polyselect.nq = 1296 # this is 6^4
+tasks.polyselect.nrkeep = 200
+tasks.wutimeout = 24000 # required for rootsieve in degree 6
+
+tasks.lim0 = 500000000
+tasks.lim1 = 800000000
+tasks.lpb0 = 33
+tasks.lpb1 = 34
+tasks.sieve.mfb0 = 66
+tasks.sieve.mfb1 = 99
+tasks.sieve.ncurves0 = 21
+tasks.sieve.ncurves1 = 26
+tasks.A = 32
+tasks.sieve.sqside = 0
+tasks.qmin = 250000000
+tasks.sieve.qrange = 100000
+tasks.sieve.wutimeout = 6000
+tasks.sieve.maxtimedout = 1000000
+tasks.sieve.maxfailed = 1000000
+
+tasks.filter.purge.keep = 160
+tasks.filter.target_density = 170.0
+
+tasks.linalg.bwc.interleaving = 0
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+
+tasks.linalg.characters.nchar = 50

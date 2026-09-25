@@ -1,0 +1,70 @@
+#include "cado.h" // IWYU pragma: keep
+
+#include <climits>     // for ULONG_MAX
+#include <cstdio>      // for fprintf, stderr, NULL, fclose, fopen, stdout
+#include <cstdlib>     // for exit, EXIT_FAILURE, EXIT_SUCCESS
+#include "batch.hpp"    // for create_batch_file
+#include "cado_poly.hpp"
+#include "cxx_mpz.hpp"
+#include "mpz_poly.h"
+#include "verbose.hpp"    // verbose_decl_usage
+#include "params.hpp"
+#include "las-side-config.hpp"
+
+
+static void declare_usage(cxx_param_list & pl)
+{
+    pl.declare_usage("poly", "poly file");
+    pl.declare_usage("t", "number of threads");
+
+    siever_side_config::declare_usage(pl);
+    batch_side_config::declare_usage(pl);
+
+    verbose_decl_usage(pl);
+}
+
+// coverity[root_function]
+int
+main (int argc, char const *argv[])
+{
+  cxx_param_list pl;
+  cxx_cado_poly cpoly;
+  unsigned long nb_threads = 1;
+
+  declare_usage(pl);
+
+  pl.process_command_line_and_extra_parameter_files(argc, argv);
+
+  verbose_interpret_parameters(pl);
+  pl.print_command_line(stdout);
+
+  const char * filename;
+  if ((filename = pl.lookup_old("poly")) == NULL)
+      pl.fail("Error: parameter -poly is mandatory\n");
+  if (!cpoly.read(filename)) {
+      fprintf (stderr, "Error reading polynomial file %s\n", filename);
+      exit (EXIT_FAILURE);
+  }
+
+  pl.parse("t", nb_threads);
+
+  int const nsides = cpoly.nsides();
+
+  std::vector<siever_side_config> sides;
+  siever_side_config::parse(pl, sides, nsides, { "lim" });
+
+  std::vector<batch_side_config> bsides;
+  batch_side_config::parse(pl, bsides, nsides, { "batchlpb", "batchfile" });
+  
+  cxx_mpz batchP[2];
+
+  double extra_time = 0;
+  for (int side = 0; side < nsides; ++side) {
+      siever_side_config  const& S(sides[side]);
+      batch_side_config  const& bS(bsides[side]);
+      create_batch_file (bS.batchfilename, batchP[side], S.lim,
+              1UL << bS.batchlpb, cpoly[side], stdout, nb_threads, extra_time);
+  }
+
+  return EXIT_SUCCESS;
+}

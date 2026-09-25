@@ -1,0 +1,54 @@
+###########################################################################
+#     Parameter file for Cado-NFS
+###########################################################################
+# See parameters/factor/params.c90 for an example which contains some
+# documentation.
+# See parameters/cl/params.qs.d90 for an example which contains some
+# documentation specific to the QS algorithm for class groups computation.
+
+# This file corresponds to the parameters used by T. Kleinjung in his paper
+# "Quadratic Sieving", Math. Comp., 2016.
+
+###########################################################################
+# General parameters
+###########################################################################
+
+name = d100
+
+###########################################################################
+# Sieve
+###########################################################################
+
+tasks.I = 14 # 2^I/2 is called M in the paper
+tasks.lim0 = 200000 # called F in the paper
+tasks.lpb0 = 32 # called L in the paper
+tasks.sieve.mfb0 = 64 # called C in the paper
+
+tasks.sieve.qfac_nfac = 14 # called n in the paper
+tasks.sieve.qfac_min = 1693 # lower bound of the ai-range
+tasks.sieve.qfac_max = 2082 # upper bound of the ai-range
+
+tasks.sieve.qrange = 250
+
+tasks.sieve.ncurves0 = 15
+
+tasks.sieve.rels_wanted = 2500000
+
+###########################################################################
+# Filtering
+###########################################################################
+
+tasks.filter.purge.col_min_index = 10000
+tasks.filter.target_density = 170.0
+tasks.nmatrices = 2
+
+###########################################################################
+# Linalg
+###########################################################################
+
+# Not clearly stated in the paper but found in the 2019's paper "CSI-FiSh:
+# Efficient Isogeny based Signatures through Class Group Computations" by
+# W.  Beullens, T. Kleinjung and F. Vercauteren, in which they compute the
+# class group of a 155-digit discriminant.
+tasks.linalg.moduli_nbits = 64
+# Note that with cado, using 256 would be better

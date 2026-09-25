@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Sieve launcher for cadofactor: runs glas-gpu in place of las.
+#
+#   tasks.sieve.las.execpath=<this directory> tasks.sieve.las.execbin=las-glas
+#
+# cadofactor passes the las command line. The launcher picks one GPU
+# per process from the special-q range (GLAS_GPU overrides), gives the
+# process the CPUs of that GPU's share of the host, and replaces the
+# -t value with that share (GLAS_THREADS overrides). GLAS_BIN names the
+# glas-gpu binary; the default is the one next to this directory, or
+# glas-gpu on the PATH (a client that downloaded this launcher from the
+# server runs it from its download directory).
+set -Eeuo pipefail
+q0=0
+previous=
+for argument in "$@"; do
+  if [[ "$previous" == "-q0" ]]; then
+    q0="$argument"
+    break
+  fi
+  previous="$argument"
+done
+ngpu=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+gpu="${GLAS_GPU:-$((q0 / 10000 % ngpu))}"
+quota=$(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo max)
+read -r workers cpus < <(python3 -c '
+import os, sys
+gpu, ngpu, quota = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3].split()
+cpus = sorted(os.sched_getaffinity(0))
+ncpu = len(cpus) if quota[0] == "max" else min(len(cpus), int(quota[0]) // int(quota[1]))
+per = len(cpus) // ngpu
+print(ncpu // ngpu, ",".join(map(str, cpus[gpu * per:(gpu + 1) * per])))' "$gpu" "$ngpu" "$quota")
+workers="${GLAS_THREADS:-$workers}"
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t) shift ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+# Keep stderr empty: the CADO client uploads it as the statistics file,
+# where the server reads the relation count.
+glas=${GLAS_BIN:-$(dirname "$(readlink -f "$0")")/../glas-gpu}
+[ -x "$glas" ] || glas=glas-gpu
+exec env CUDA_VISIBLE_DEVICES="$gpu" GLAS_PIN=1 \
+  taskset -c "$cpus" "$glas" -gpu "${args[@]}" -t "$workers"

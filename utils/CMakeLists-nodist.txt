@@ -1,0 +1,5 @@
+
+add_executable(cachesize EXCLUDE_FROM_ALL cachesize.c)
+target_link_libraries(cachesize utils)
+
+# vim: set ft=cmake:

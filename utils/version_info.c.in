@@ -1,0 +1,10 @@
+#include "cado.h" // IWYU pragma: keep
+#include "version_info.h" // IWYU pragma: keep
+
+/* CADO_REV indicates the scm-level revision */
+const char * cado_revision_string = "@CADO_REV@";
+
+unsigned int cado_version_major = @CADO_VERSION_MAJOR@;
+unsigned int cado_version_minor = @CADO_VERSION_MINOR@;
+const char * cado_version_string = "@CADO_VERSION_STRING@";
+

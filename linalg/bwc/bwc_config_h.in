@@ -1,0 +1,19 @@
+#ifndef CADO_BWC_CONFIG_H
+#define CADO_BWC_CONFIG_H
+
+#include "cado_config.h"
+#include "cado_mpi_config.h"
+
+/* This is the only raison d'être for this file. I couldn't find a way
+ * to have linalg/bwc/CMakeLists.txt set something which is reflected in
+ * the top-level generated cado_config.h :-(
+ */
+#cmakedefine    COOKED_BWC_BACKENDS @COOKED_BWC_BACKENDS@
+
+
+/* The following is only defined for statically linked builds */
+#cmakedefine    COOKED_ARITHMETIC_BACKENDS @COOKED_ARITHMETIC_BACKENDS@
+
+#cmakedefine    BUILD_DYNAMICALLY_LINKABLE_BWC
+
+#endif	/* BWC_CONFIG_H_ */

@@ -1,0 +1,7 @@
+build/
+glas
+glas-gpu
+gps1
+eprime
+*.o
+*.so

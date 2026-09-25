@@ -1,0 +1,303 @@
+#include "cado.h" // IWYU pragma: keep
+
+/* This is a very silly program which merely reads the matrix and then
+ * exits. It must come before the prep program, and coalescing this one
+ * and prep into one would be difficult and/or artificial, because they
+ * handle different data widths.
+ */
+#include <cstdint>     /* AIX wants it first (it's a bug) */
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+
+#include <memory>
+
+#include <gmp.h>                 // for mpz_cmp_ui
+
+#include "arith-cross.hpp"
+#include "arith-generic.hpp"
+#include "balancing.hpp"         // for DUMMY_VECTOR_COORD_VALUE, DUMMY_VECT...
+#include "bw-common.hpp"
+#include "intersections.h"
+#include "macros.h"
+#include "matmul_top.hpp"
+#include "matmul_top_vec.hpp"
+#include "mmt_vector_pair.hpp"
+#include "parallelizing_info.hpp"
+#include "params.hpp"
+#include "select_mpi.h"
+
+static void mmt_full_vec_set_dummy1(mmt_vec & y, size_t unpadded)
+{
+    mmt_full_vec_set_zero(y);
+
+#if 0
+    /* this should be equivalent to the other branch */
+    if (!mmt_vec_is_shared(y) || y.pi.wr[y.d].trank == 0) {
+        for(unsigned int i = y.i0 ; i < y.i1 && i < unpadded ; i++) {
+            arith_generic::elt * dst = y.abase->vec_subvec(y.v, i - y.i0);
+            uint64_t value = DUMMY_VECTOR_COORD_VALUE(i);
+            memcpy(dst, &value, sizeof(uint64_t));
+        }
+    }
+    if (!mmt_vec_is_shared(y)) {
+        y.pi.wr[y.d].serialize_threads(__FILE__, __LINE__);
+        y.abase->vec_set(y.v, mmt_vec_sibling(y, 0).v, y.i1 - y.i0);
+    }
+    y.pi.wr[y.d].serialize_threads(__FILE__, __LINE__);
+#else
+    for(unsigned int j = 0 ; j < y.pi.wr[y.d].njobs ; j++) {
+        for(size_t di = 0 ; di < mmt_my_own_size_in_items(y) ; di++) {
+            size_t const i = y.i0 + mmt_my_own_offset_in_items(y, j) + di;
+            if (i >= unpadded)
+                break;
+            arith_generic::elt * dst = y.abase->vec_subvec(mmt_my_own_subvec(y, j), di);
+            uint64_t value = DUMMY_VECTOR_COORD_VALUE(i);
+            memcpy(dst, &value, sizeof(uint64_t));
+        }
+    }
+    y.pi.wr[y.d].serialize_threads(__FILE__, __LINE__);
+    y.consistency = 1;
+    mmt_vec_share_across_threads(y);
+#endif
+    y.consistency = 2;
+}
+
+static void mmt_full_vec_set_dummy2(mmt_vec & y, size_t unpadded)
+{
+    mmt_full_vec_set_zero(y);
+
+#if 0
+    /* this should be equivalent to the other branch */
+    if (!mmt_vec_is_shared(y) || y.pi.wr[y.d].trank == 0) {
+        for(unsigned int i = y.i0 ; i < y.i1 && i < unpadded ; i++) {
+            arith_generic::elt * dst = y.abase->vec_subvec(y.v, i - y.i0);
+            uint64_t value = DUMMY_VECTOR_COORD_VALUE2(i);
+            memcpy(dst, &value, sizeof(uint64_t));
+        }
+    }
+    if (!mmt_vec_is_shared(y)) {
+        y.pi.wr[y.d].serialize_threads(__FILE__, __LINE__);
+        y.abase->vec_set(y.v, mmt_vec_sibling(y, 0).v, y.i1 - y.i0);
+    }
+    y.pi.wr[y.d].serialize_threads(__FILE__, __LINE__);
+#else
+    for(unsigned int j = 0 ; j < y.pi.wr[y.d].njobs ; j++) {
+        for(size_t di = 0 ; di < mmt_my_own_size_in_items(y) ; di++) {
+            size_t const i = y.i0 + mmt_my_own_offset_in_items(y, j) + di;
+            if (i >= unpadded)
+                break;
+            arith_generic::elt * dst = y.abase->vec_subvec(mmt_my_own_subvec(y, j), di);
+            uint64_t value = DUMMY_VECTOR_COORD_VALUE2(i);
+            memcpy(dst, &value, sizeof(uint64_t));
+        }
+    }
+    y.pi.wr[y.d].serialize_threads(__FILE__, __LINE__);
+    y.consistency = 1;
+    mmt_vec_share_across_threads(y);
+#endif
+    y.consistency = 2;
+}
+
+static void * dispatch_prog(parallelizing_info & pi, cxx_param_list & pl, void * arg MAYBE_UNUSED)
+{
+    bool fake = pl.has("random_matrix") || pl.has("static_random_matrix");
+    if (fake) bw->skip_online_checks = 1;
+
+    int ys[2] = { bw->ys[0], bw->ys[1], };
+    if (pi.interleaved) {
+        ASSERT_ALWAYS((bw->ys[1] - bw->ys[0]) % 2 == 0);
+        ys[0] = bw->ys[0] + pi.interleaved->idx * (bw->ys[1]-bw->ys[0])/2;
+        ys[1] = ys[0] + (bw->ys[1]-bw->ys[0])/2;
+    }
+
+    std::unique_ptr<arith_generic> A(arith_generic::instance(bw->p, ys[1]-ys[0]));
+    std::unique_ptr<arith_cross_generic> AxA(arith_cross_generic::instance(A.get(), A.get()));
+
+    /*****************************************
+     *             Watch out !               *
+     *****************************************/
+     
+    /* HERE is the place where something actually happens. The rest of
+     * this function are just sanity checks. Matrix dispatch can, in
+     * fact, be done from any program which creates a matmul_top_data
+     * object. This
+     * function calls mmt_finish_init, which calls
+     * matmul_top_read_submatrix, which eventuallmy,a!ls
+     * balancing_get_matrix_u32, which hooks into the balancing code.
+     * This is UNLESS either of the two command-line arguments are set,
+     * because these trigger special behaviour:
+     * export_cachelist : see this file, in fact. This makes "dispatch" a
+     * quick cache file listing tool, which helps the perl script a bit.
+     * random_matrix_size : for creating test matrices, essentially for
+     * krylov/mksol speed testing.
+     */
+    matmul_top_data mmt(A.get(), pi, pl, bw->dir);
+
+    mmt_vector_pair ymy(mmt, 1);
+    mmt_vec & y = ymy[0];
+    mmt_vec & my = ymy[1];
+
+    unsigned int const unpadded = MAX(mmt.n0[0], mmt.n0[1]);
+
+    const char * sanity_check_vector = pl.lookup_old("sanity_check_vector");
+    bool const only_export = pl.has("export_cachelist");
+    int build_only = 0;
+    pl.parse("build_only", build_only);
+
+    // in no situation shall we try to do our sanity check if we've just
+    // been told to export our cache list. Note also that this sanity
+    // check is currently only valid for GF(2).
+    if (sanity_check_vector != nullptr && !only_export && !build_only && mpz_cmp_ui(bw->p, 2) == 0 && mmt.abase->simd_groupsize()) {
+        /* We have computed a sanity check vector, which is H=M*K, with K
+         * constant and easily given. Note that we have not computed K*M,
+         * but really M*K. Thus independently of which side we prefer, we
+         * are going to check the matrix product in a rigid direction.
+         *
+         * check 1: compute M*K again using the mmt structures, and
+         * compare with H1. This is matmul_top_mul(mmt, 1).
+         *
+         * check 2: for some vector L, compute (L, H=M*K) and (L*M, K).
+         * This means matmul_top_mul(mmt, 0).
+         */
+        const char * checkname;
+
+        checkname = "1st check: consistency of M*arbitrary1 (Hx == H1)";
+
+        mmt_full_vec_set_dummy1(y, unpadded);
+
+        mmt_vec_twist(mmt, y);
+        matmul_top_mul(mmt, ymy.vectors(), nullptr);
+        mmt_vec_untwist(mmt, y);
+
+        mmt_vec_save(y, "Hx{}-{}", unpadded, 0);
+
+        // compare if files are equal.
+        if (pi.m.jrank == 0 && pi.m.trank == 0) {
+            char cmd[1024];
+            int rc = snprintf(cmd, sizeof(cmd), "diff -q %s Hx0-64", sanity_check_vector);
+            ASSERT_ALWAYS(rc >= 0 && size_t(rc) < sizeof(cmd));
+            rc = system(cmd);
+            if (rc) {
+                printf("%s : failed\n", checkname);
+#ifdef WEXITSTATUS
+                fprintf(stderr, "%s returned %d\n", cmd, WEXITSTATUS(rc));
+#else
+                fprintf(stderr, "%s returned %d\n", cmd, rc);
+#endif
+                exit(EXIT_FAILURE);
+            } else {
+                printf("%s : ok\n", checkname);
+            }
+        }
+        pi.m.serialize(__FILE__, __LINE__);
+
+        checkname = "2nd check: (arbitrary2, M*arbitrary1) == (arbitrary2*M==Hy, arbitrary1)";
+
+        mmt_full_vec_set_dummy2(my, unpadded);
+
+        /* This is L. Now compute the dot product. */
+        arith_generic::elt * dp0;
+        arith_generic::elt * dp1;
+        dp0 = A->alloc(A->simd_groupsize(), ALIGNMENT_ON_ALL_BWC_VECTORS);
+        dp1 = A->alloc(A->simd_groupsize(), ALIGNMENT_ON_ALL_BWC_VECTORS);
+        unsigned int how_many;
+        unsigned int offset_c;
+        unsigned int offset_v;
+        how_many = intersect_two_intervals(&offset_c, &offset_v,
+                my.i0, my.i1,
+                y.i0, y.i1);
+        A->vec_set_zero(dp0, A->simd_groupsize());
+        AxA->add_dotprod(dp0,
+                A->vec_subvec(my.v, offset_c),
+                A->vec_subvec(y.v, offset_v),
+                how_many);
+        pi.m.allreduce(nullptr, dp0, A->simd_groupsize(), mmt.pitype, BWC_PI_SUM);
+
+        /* now we can throw away Hx */
+
+        /* we do a transposed multiplication, here. It's a bit of a
+         * quirk, admittedly. We need to build a reversed vector list.
+         */
+        mmt_vec_twist(mmt, my);
+        {
+            mmt_vector_pair myy(mmt, 0);
+            mmt_full_vec_set(myy[0], my);
+            matmul_top_mul(mmt, myy.vectors(), nullptr);
+            mmt_full_vec_set(my, myy[0]);
+        }
+        mmt_vec_untwist(mmt, my);
+        mmt_vec_save(my, "Hy{}-{}", unpadded, 0);
+
+        mmt_full_vec_set_dummy1(y, unpadded);
+
+        A->vec_set_zero(dp1, A->simd_groupsize());
+        AxA->add_dotprod(dp1,
+                A->vec_subvec(my.v, offset_c),
+                A->vec_subvec(y.v, offset_v),
+                how_many);
+        pi.m.allreduce(nullptr, dp1, A->simd_groupsize(), mmt.pitype, BWC_PI_SUM);
+        int const diff = memcmp(dp0, dp1, A->vec_elt_stride(A->simd_groupsize()));
+        if (pi.m.jrank == 0 && pi.m.trank == 0) {
+            if (diff) {
+                printf("%s : failed\n", checkname);
+                fprintf(stderr, "aborting on sanity check failure.\n");
+                exit(1);
+            }
+            printf("%s : ok\n", checkname);
+        }
+        A->free(dp0);
+        A->free(dp1);
+    }
+
+    return nullptr;
+}
+
+
+// coverity[root_function]
+int main(int argc, char const * argv[])
+{
+    cxx_param_list pl;
+
+    bw_common_init(bw, &argc, &argv);
+    parallelizing_info::init_attribute_things();
+
+    bw_common_decl_usage(pl);
+    parallelizing_info::declare_usage(pl);
+    matmul_top_decl_usage(pl);
+    /* declare local parameters and switches */
+    pl.declare_usage("build_only",
+            "build and save the cache (and the sanity_check_vector file),"
+            " skip the two matrix product checks: a later dispatch run"
+            " that loads the cache runs them");
+
+    bw_common_parse_cmdline(bw, pl, &argc, &argv);
+
+    bw_common_interpret_parameters(bw, pl);
+    parallelizing_info::lookup_parameters(pl);
+    matmul_top_lookup_parameters(pl);
+    pl.lookup("build_only");
+
+    ASSERT_ALWAYS(pl.has("ys"));
+    ASSERT_ALWAYS(!pl.has("solutions"));
+
+    if (pl.warn_unused()) {
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        if (!rank) pl.print_usage(stderr);
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+
+    if (bw->ys[0] < 0) { fprintf(stderr, "no ys value set\n"); exit(1); }
+
+    /* Forcibly disable interleaving here */
+    pl.remove_key("interleaving");
+
+    pi_go(dispatch_prog, pl, 0);
+
+    parallelizing_info::clear_attribute_things();
+    bw_common_clear(bw);
+
+    return 0;
+}
+

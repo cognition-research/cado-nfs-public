@@ -1,0 +1,216 @@
+#ifndef CADO_CONFIG_H
+#define CADO_CONFIG_H
+
+/* cado_config.h is auto-generated (by cmake) from cado_config_h.in
+ * cado_config_h.in is *NOT* auto-generated */
+
+/* we strive to list the cmakedefine's in the order they are created by
+ * CMakeLists.txt.
+ *
+ * Note that some flags are used only in the CMakeLists.txt files. As
+ * such, they need not appear here, but we could expose these if need
+ * arises. The corresponding names are put in comments below.
+ */
+
+#define CFLAGS      "@CMAKE_C_FLAGS@"
+#define CXXFLAGS    "@CMAKE_CXX_FLAGS@"
+#define    ULONG_BITS   @ULONG_BITS@
+#define    ULONGLONG_BITS   @ULONGLONG_BITS@
+
+#cmakedefine CADO_NFS_USE_SHARED_LIBS
+
+#cmakedefine HAVE_GDB_PYTHON_PRETTY_PRINT
+
+#define GMP_INCDIR    "@GMP_INCDIR@"
+#define GMP_LIBDIR    "@GMP_LIBDIR@"
+#define MPIR_INCDIR    "@MPIR_INCDIR@"
+#define MPIR_LIBDIR    "@MPIR_LIBDIR@"
+#cmakedefine    HAVE_MPIR
+
+// #cmakedefine HAVE_KNOWN_GMP_RANDOM_BEHAVIOUR
+
+#cmakedefine    HAVE_MMX
+
+#cmakedefine    HAVE_SSE2
+
+#cmakedefine    HAVE_SSE3
+
+#cmakedefine    HAVE_SSSE3
+
+#cmakedefine    HAVE_SSE41
+
+#cmakedefine    HAVE_AVX
+
+#cmakedefine    HAVE_AVX2
+
+#cmakedefine    HAVE_AVX512F
+
+#cmakedefine    HAVE_AVX512VL
+
+#cmakedefine    HAVE_AVX512DQ
+
+#cmakedefine    HAVE_PCLMUL
+
+#cmakedefine    HAVE_ARM_NEON
+
+#cmakedefine    HAVE_GCC_STYLE_AMD64_INLINE_ASM
+#cmakedefine    HAVE_GCC_STYLE_ARM_INLINE_ASM
+
+#cmakedefine    VOLATILE_IF_GCC_UBUNTU_BUG
+#cmakedefine    VOLATILE_IF_GCC_58805_BUG
+
+#cmakedefine HAVE_GAS_SYNTAX_ASSEMBLY_SOURCES
+
+#cmakedefine HAVE_EXECINFO
+
+#cmakedefine STATIC_ANALYSIS
+
+#cmakedefine HAVE_GLIBC
+#cmakedefine HAVE_MUSL
+#cmakedefine MUSL_VERSION @MUSL_VERSION@
+
+#cmakedefine    HAVE_CURL
+
+#cmakedefine    HAVE_LOG2
+#cmakedefine    HAVE_EXP2
+
+#cmakedefine    HAVE_STDCPP_MATH_SPEC_FUNCS
+
+#cmakedefine    HAVE_RESOURCE_H
+#cmakedefine    HAVE_UTSNAME_H
+#cmakedefine    HAVE_STATVFS_H
+#cmakedefine    HAVE_WAIT_H
+#cmakedefine    HAVE_LIBGEN_H
+#cmakedefine    HAVE_SYS_MMAN_H
+
+#cmakedefine    HAVE_SIGHUP
+#cmakedefine    HAVE_POSIX_MEMALIGN
+#cmakedefine    HAVE_ALIGNAS
+#cmakedefine    HAVE_NANOSLEEP
+#cmakedefine    HAVE_USLEEP
+#cmakedefine    HAVE_POPEN
+#cmakedefine    HAVE_PCLOSE
+#cmakedefine    HAVE_GETRUSAGE
+#cmakedefine    HAVE_LRAND48
+#cmakedefine    HAVE_STRDUP
+#cmakedefine    HAVE_STRNDUP
+#cmakedefine    HAVE_STRNLEN
+// #cmakedefine HAVE_SIGACTION
+#cmakedefine    HAVE_WAITPID
+#cmakedefine    HAVE_CTIME_R
+#cmakedefine    HAVE_REALPATH
+#cmakedefine    HAVE_MMAP
+#cmakedefine    HAVE_SYSCONF
+
+#cmakedefine    HAVE_RUSAGE_THREAD
+#cmakedefine    HAVE_CLOCK_MONOTONIC
+#cmakedefine    HAVE_CLOCK_MONOTONIC_RAW
+#cmakedefine    HAVE_CLOCK_THREAD_CPUTIME_ID
+#cmakedefine    HAVE_CLOCK_PROCESS_CPUTIME_ID
+
+#cmakedefine    HAVE_SYNC_FETCH
+
+#cmakedefine    HAVE_CXX_FENV
+
+#cmakedefine    HAVE_ASPRINTF
+
+#cmakedefine    HAVE_USUAL_SRAND_DETERMINISTIC_BEHAVIOR
+#cmakedefine    HAVE_SRAND_DETERMINISTIC
+
+#cmakedefine    HAVE_STRLCPY
+#cmakedefine    HAVE_STRLCAT
+
+#cmakedefine    HAVE_LINUX_BINFMTS_H
+
+#cmakedefine    HAVE_HWLOC
+
+#cmakedefine    HAVE_GMPECM
+
+#cmakedefine    HAVE_MPFR
+#cmakedefine    HAVE_MPC
+
+#cmakedefine    HAVE_CXXABI_H
+
+#cmakedefine    HAVE_REGEX_H
+
+#cmakedefine    HAVE_PTHREAD_BARRIER_WAIT
+/* In the C source files, we may of course check MPI_VERSION and
+ * MPI_SUBVERSION by ourselves. However we would like to possibly
+ * dismiss, on the per-implementation basis, the claim of MPI-3 support.
+ */
+#cmakedefine    HAVE_MPI2_API
+#cmakedefine    HAVE_MPI3_API
+#cmakedefine    HAVE_OPENMP
+
+#cmakedefine    HAVE_EXECUTABLE_SUFFIX
+#ifdef HAVE_EXECUTABLE_SUFFIX
+#define EXECUTABLE_SUFFIX "@CMAKE_EXECUTABLE_SUFFIX@"
+#endif
+
+#cmakedefine    HAVE_M4RI
+#cmakedefine    HAVE_M4RIE
+
+#cmakedefine    HAVE_JEVENTS
+
+#cmakedefine    HAVE_INT128
+
+#cmakedefine    HAVE_ALIGNED_ALLOC
+
+#cmakedefine    HAVE_SYS_ENDIAN_H
+
+#cmakedefine    HAVE_BSWAP32_IN_SYS_ENDIAN_H
+
+#cmakedefine    UINT64_T_IS_EXACTLY_UNSIGNED_LONG
+#cmakedefine    UINT64_T_IS_EXACTLY_UNSIGNED_LONG_LONG
+#cmakedefine    INT64_T_IS_EXACTLY_LONG
+#cmakedefine    INT64_T_IS_EXACTLY_LONG_LONG
+#cmakedefine    UINT32_T_IS_EXACTLY_UNSIGNED_LONG
+#cmakedefine    UINT32_T_IS_EXACTLY_UNSIGNED
+#cmakedefine    INT32_T_IS_EXACTLY_LONG
+#cmakedefine    INT32_T_IS_EXACTLY_INT
+#cmakedefine    MP_LIMB_T_IS_EXACTLY_UNSIGNED_LONG
+#cmakedefine    MP_LIMB_T_IS_EXACTLY_UNSIGNED_LONG_LONG
+#cmakedefine    MP_SIZE_T_IS_EXACTLY_LONG_LONG
+#cmakedefine    MP_SIZE_T_IS_EXACTLY_LONG
+#cmakedefine    MP_SIZE_T_IS_EXACTLY_INT
+#cmakedefine    MPZ_INTERNAL_SIZE_T_IS_EXACTLY_LONG_LONG
+#cmakedefine    MPZ_INTERNAL_SIZE_T_IS_EXACTLY_LONG
+#cmakedefine    MPZ_INTERNAL_SIZE_T_IS_EXACTLY_INT
+#cmakedefine    UNSIGNED_LONG_LONG_IS_EXACTLY_UNSIGNED_LONG
+#cmakedefine    UNSIGNED_LONG_IS_EXACTLY_UNSIGNED
+#cmakedefine    LONG_LONG_IS_EXACTLY_LONG
+#cmakedefine    LONG_IS_EXACTLY_INT
+
+#cmakedefine    UINT64_T_IS_COMPATIBLE_WITH_UNSIGNED_LONG
+#cmakedefine    UINT64_T_IS_COMPATIBLE_WITH_UNSIGNED_LONG_LONG
+#cmakedefine    INT64_T_IS_COMPATIBLE_WITH_LONG
+#cmakedefine    INT64_T_IS_COMPATIBLE_WITH_LONG_LONG
+#cmakedefine    UINT32_T_IS_COMPATIBLE_WITH_UNSIGNED_LONG
+#cmakedefine    UINT32_T_IS_COMPATIBLE_WITH_UNSIGNED
+#cmakedefine    INT32_T_IS_COMPATIBLE_WITH_LONG
+#cmakedefine    INT32_T_IS_COMPATIBLE_WITH_INT
+#cmakedefine    MP_LIMB_T_IS_COMPATIBLE_WITH_UNSIGNED_LONG
+#cmakedefine    MP_LIMB_T_IS_COMPATIBLE_WITH_UNSIGNED_LONG_LONG
+#cmakedefine    MP_SIZE_T_IS_COMPATIBLE_WITH_LONG_LONG
+#cmakedefine    MP_SIZE_T_IS_COMPATIBLE_WITH_LONG
+#cmakedefine    MP_SIZE_T_IS_COMPATIBLE_WITH_INT
+#cmakedefine    MPZ_INTERNAL_SIZE_T_IS_COMPATIBLE_WITH_LONG_LONG
+#cmakedefine    MPZ_INTERNAL_SIZE_T_IS_COMPATIBLE_WITH_LONG
+#cmakedefine    MPZ_INTERNAL_SIZE_T_IS_COMPATIBLE_WITH_INT
+
+#define CADO_MPI_SIZE_T    @CADO_MPI_SIZE_T@
+#define CADO_MPI_SSIZE_T   @CADO_MPI_SSIZE_T@
+#define CADO_MPI_UINT32_T  @CADO_MPI_UINT32_T@
+#define CADO_MPI_UINT64_T  @CADO_MPI_UINT64_T@
+#define CADO_MPI_INT32_T   @CADO_MPI_INT32_T@
+#define CADO_MPI_INT64_T   @CADO_MPI_INT64_T@
+#define CADO_MPI_MP_LIMB_T   @CADO_MPI_MP_LIMB_T@
+#define CADO_MPI_MP_SIZE_T   @CADO_MPI_MP_SIZE_T@
+#define CADO_MPI_MPZ_INTERNAL_SIZE_T   @CADO_MPI_MPZ_INTERNAL_SIZE_T@
+
+#cmakedefine HAVE_LIBSTDCXX_BUG_114153
+
+/* see also select_mpi.h for c++ templates meant to help in determining mpi type tags */
+
+/* vim:set ft=c: */
+#endif  /* CADO_CONFIG_H */

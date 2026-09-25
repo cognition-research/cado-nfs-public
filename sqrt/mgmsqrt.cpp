@@ -1,0 +1,128 @@
+#include "cado.h" // IWYU pragma: keep
+
+/* see montgomery.md for some documentation. */
+
+#include <cstdlib>
+#include <cstdio>
+
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <utility>
+
+#include "fmt/base.h"
+
+#include "cado_poly.hpp"
+#include "params.hpp"
+#include "renumber.hpp"
+#include "relation.hpp"
+#include "typedefs.h"
+#include "utils_cxx.hpp"
+#include "numbertheory/number_field.hpp"
+#include "numbertheory/number_field_order.hpp"
+
+struct montgomery_eth_root {
+    number_field const & K;
+    number_field_order const & OK;
+    std::vector<std::pair<index_t, int>> const & ideals;
+    std::vector<std::pair<relation_ab, int>> const & abs;
+    int prec;
+
+    montgomery_eth_root(number_field const & K,
+            number_field_order const & OK,
+            std::vector<std::pair<index_t, int>> const & ideals,
+            std::vector<std::pair<relation_ab, int>> const & abs,
+            int prec)
+        : K(K)
+        , OK(OK)
+        , ideals(ideals)
+        , abs(abs)
+        , prec(prec)
+    {
+    }
+};
+
+struct mgmsqrt {
+    cxx_cado_poly cpoly;
+    unsigned int prec = 1000;
+    renumber_t R;
+    int e;
+    int side;
+
+    number_field K;
+    number_field_order OK;
+
+    std::vector<std::pair<index_t, int>> ideals;
+    std::vector<std::pair<relation_ab, int>> abs;
+
+    static void declare_usage(cxx_param_list & pl) {
+        pl.declare_usage("prec", "initial precision");
+        pl.declare_usage("ideals", "ideal indices (and valuations)");
+        pl.declare_usage("renumber", "renumber table");
+        pl.declare_usage("ab", "(a,b) pairs (and exponents)");
+        pl.declare_usage("e", "root order");
+        pl.declare_usage("side", "side");
+    }
+
+    explicit mgmsqrt(cxx_param_list & pl)
+        : cpoly(pl)
+        , R(cpoly, pl.parse_mandatory<std::string>("renumber"), true)
+        , e(pl.parse_mandatory<int>("e"))
+        , side(pl.parse_mandatory<int>("side"))
+        , K(cpoly[side])
+        , OK(K.maximal_order())
+    {
+        K.bless("alpha");
+        {
+            fmt::print("# Reading (a,b) pairs and exponents\n");
+            std::ifstream ab(pl.parse_mandatory<std::string>("ab"));
+            for(std::string s; std::getline(ab, s); ) {
+                strip(s);
+                if (s.empty() || s[0] == '#')
+                    continue;
+                decltype(abs)::value_type x;
+                if (!(std::istringstream(s) >> x.first >> x.second))
+                    break;
+                abs.emplace_back(x);
+            }
+        }
+        {
+            fmt::print("# Reading ideal indices and exponents\n");
+            std::ifstream Iv(pl.parse_mandatory<std::string>("ideals"));
+            for(std::string s; std::getline(Iv, s); ) {
+                strip(s);
+                if (s.empty() || s[0] == '#')
+                    continue;
+                decltype(ideals)::value_type x;
+                if (!(std::istringstream(s) >> x.first >> x.second))
+                    break;
+                ideals.emplace_back(x);
+            }
+        }
+    }
+};
+
+int main(int argc, char const * argv[])
+{
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    cxx_param_list pl;
+
+    cxx_cado_poly::declare_usage(pl);
+    mgmsqrt::declare_usage(pl);
+
+    /*
+    configure_switches(pl);
+    configure_aliases(pl);
+    */
+
+    pl.process_command_line(argc, argv, false);
+
+    pl.print_command_line(stdout);
+
+    mgmsqrt MTY(pl);
+
+
+    return 0;
+}

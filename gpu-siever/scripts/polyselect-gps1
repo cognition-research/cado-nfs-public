@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Stage-1 polynomial selection launcher for cadofactor: runs gps1 in
+# place of polyselect.
+#
+#   tasks.polyselect.polyselect.execpath=<this directory>
+#   tasks.polyselect.polyselect.execbin=polyselect-gps1
+#
+# It translates the flags cadofactor passes to its own polyselect
+# binary into gps1 flags and assigns a GPU: cadofactor hands out
+# consecutive ad ranges, so the range index spreads the workunits over
+# the GPUs (GLAS_GPU overrides). GPS1_BIN names the gps1 binary; the
+# default is the one next to this directory, or gps1 on the PATH (a
+# client that downloaded this launcher from the server runs it from its
+# download directory).
+set -Eeuo pipefail
+args=()
+admin=0
+admax=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -degree) args+=(-d "$2") ;;
+    -t) export OMP_NUM_THREADS="$2" ;;
+    -admin) admin=$2; args+=("$1" "$2") ;;
+    -admax) admax=$2; args+=("$1" "$2") ;;
+    *) args+=("$1" "$2") ;;
+  esac
+  shift 2
+done
+ngpu=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
+gpu="${GLAS_GPU:-$((admin / (admax - admin) % ngpu))}"
+gps1=${GPS1_BIN:-$(dirname "$(readlink -f "$0")")/../gps1}
+[ -x "$gps1" ] || gps1=gps1
+exec env CUDA_VISIBLE_DEVICES="$gpu" "$gps1" -sopt-gpu 1 "${args[@]}"

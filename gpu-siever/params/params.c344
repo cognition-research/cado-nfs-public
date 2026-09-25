@@ -1,0 +1,35 @@
+name = c344
+
+tasks.polyselect.degree = 6
+tasks.polyselect.P = 10000000
+tasks.polyselect.admax = 4e7
+tasks.polyselect.adrange = 5e3
+tasks.polyselect.incr = 60
+tasks.polyselect.nq = 1296 # this is 6^4
+tasks.polyselect.nrkeep = 200
+tasks.wutimeout = 24000 # required for rootsieve in degree 6
+
+tasks.lim0 = 1073741824
+tasks.lim1 = 1073741824
+tasks.lpb0 = 34
+tasks.lpb1 = 34
+tasks.sieve.mfb0 = 68
+tasks.sieve.mfb1 = 102
+tasks.sieve.ncurves0 = 25
+tasks.sieve.ncurves1 = 35
+tasks.A = 32
+tasks.sieve.sqside = 0
+tasks.qmin = 300000000
+tasks.sieve.qrange = 100000
+tasks.sieve.wutimeout = 6000
+tasks.sieve.maxtimedout = 1000000
+tasks.sieve.maxfailed = 1000000
+
+tasks.filter.purge.keep = 160
+tasks.filter.target_density = 170.0
+
+tasks.linalg.bwc.interleaving = 0
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+
+tasks.linalg.characters.nchar = 50

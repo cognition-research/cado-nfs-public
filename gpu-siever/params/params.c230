@@ -1,0 +1,38 @@
+name = c230
+
+tasks.polyselect.degree = 6
+
+tasks.polyselect.P = 10000000
+tasks.polyselect.admax = 5e7
+tasks.polyselect.adrange = 5e3
+tasks.polyselect.incr = 60
+tasks.polyselect.nq = 1296 # this is 6^4
+tasks.polyselect.nrkeep = 200
+tasks.wutimeout = 24000 # required for rootsieve in degree 6
+
+tasks.lim0 = 980000000
+tasks.lim1 = 1644872548
+tasks.lpb0 = 34
+tasks.lpb1 = 35
+tasks.sieve.mfb0 = 77
+tasks.sieve.mfb1 = 108
+tasks.sieve.ncurves0 = 33
+tasks.sieve.ncurves1 = 31
+tasks.I = 16
+
+tasks.qmin = 822436274
+
+tasks.sieve.rels_wanted = 3212000000
+
+tasks.sieve.qrange = 160000
+tasks.sieve.wutimeout = 7200
+tasks.sieve.maxtimedout = 24000
+
+tasks.filter.purge.keep = 160
+tasks.filter.target_density = 150.0
+
+tasks.linalg.bwc.interleaving = 0
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+
+tasks.linalg.characters.nchar = 50

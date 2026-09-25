@@ -1,0 +1,44 @@
+###########################################################################
+#     Parameter file for Cado-NFS
+###########################################################################
+# See parameters/factor/params.c90 for an example which contains some
+# documentation.
+# See parameters/cl/params.qs.d90 for an example which contains some
+# documentation specific to the QS algorithm for class groups computation.
+
+###########################################################################
+# General parameters
+###########################################################################
+
+name = d60
+
+###########################################################################
+# Sieve
+###########################################################################
+
+tasks.I = 14
+tasks.lim0 = 50000
+tasks.lpb0 = 20
+tasks.sieve.mfb0 = 42
+
+tasks.sieve.qfac_nfac = 8
+tasks.sieve.qfac_min = 1700
+tasks.sieve.qfac_max = 2000
+tasks.sieve.qrange = 100
+
+tasks.sieve.ncurves0 = 2
+
+tasks.sieve.rels_wanted = 60000
+
+###########################################################################
+# Filtering
+###########################################################################
+
+tasks.filter.target_density = 170.0
+tasks.nmatrices = 2
+
+###########################################################################
+# Linalg
+###########################################################################
+
+tasks.linalg.moduli_nbits = 256

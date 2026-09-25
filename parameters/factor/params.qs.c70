@@ -1,0 +1,52 @@
+###########################################################################
+#     Parameter file for Cado-NFS
+###########################################################################
+# See parameters/factor/params.c90 for an example which contains some
+# documentation.
+# See parameters/cl/params.qs.d90 and parameters/factor/params.qs.c90 for
+# examples which contains some documentation specific to the QS algorithm.
+
+###########################################################################
+# General parameters
+###########################################################################
+
+name = c70
+
+###########################################################################
+# Sieve
+###########################################################################
+
+tasks.I = 15
+tasks.lim0 = 150000
+tasks.lpb0 = 21
+tasks.sieve.mfb0 = 42
+
+tasks.sieve.qfac_nfac = 10
+tasks.sieve.qfac_min = 950
+tasks.sieve.qfac_max = 1250
+tasks.sieve.qrange = 100
+
+tasks.sieve.ncurves0 = 5
+
+tasks.sieve.rels_wanted = 45000
+
+###########################################################################
+# Filtering
+###########################################################################
+
+tasks.filter.purge.keep = 128
+tasks.filter.target_density = 170.0
+
+###########################################################################
+# Linear algebra
+###########################################################################
+
+tasks.linalg.bwc.interleaving = 0
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+
+###########################################################################
+# Characters
+###########################################################################
+
+tasks.linalg.characters.nchar = 1

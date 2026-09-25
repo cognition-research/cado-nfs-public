@@ -1,0 +1,4 @@
+add_executable(bcast-file EXCLUDE_FROM_ALL bcast-file.c)
+mark_targets_as_mpi(bcast-file)
+
+# vim: ft=cmake:

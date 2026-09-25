@@ -1,0 +1,809 @@
+#ifndef CADO_UTILS_CXX_HPP
+#define CADO_UTILS_CXX_HPP
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstddef>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <ios>
+#include <istream>
+#include <iterator>
+#include <limits>
+#include <memory>
+#include <functional>
+#include <string>
+#include <tuple>
+#include <type_traits>
+#include <utility>
+#include <vector>
+#include <stdexcept>
+
+#include "fmt/base.h"
+#include "fmt/format.h"
+
+#include "macros.h"
+
+/* Base class with private copy-constructor and assignment operator.
+   Classes which are not copy-constructible can inherit this with:
+   private NonCopyable.
+   
+   See also:
+
+   https://www.boost.org/doc/libs/1_67_0/libs/core/doc/html/core/noncopyable.html
+   */
+struct NonCopyable {
+   NonCopyable() = default;
+   ~NonCopyable() = default;
+   NonCopyable(NonCopyable&&) = delete;
+   NonCopyable& operator=(NonCopyable&&) = delete;
+   NonCopyable(NonCopyable const &) = delete;
+   NonCopyable& operator=(NonCopyable const &) = delete;
+};
+
+/* This is an example, but not a class one can inherit from: inheriting
+ * does not have the same effect as having this kind of ctors declared...
+ *
+class MoveOnly
+{
+public:
+   MoveOnly() {}
+   ~MoveOnly() {}
+   MoveOnly(const MoveOnly&) = delete;
+   MoveOnly& operator=(const MoveOnly&) = delete;
+   MoveOnly(MoveOnly&&) = default;
+   MoveOnly& operator=(MoveOnly&&) = default;
+};
+ */
+
+/* Generic tool to cause an arbitrary closure to be called at destructor
+ * time. See detached_cofac for a use case.
+ */
+template<typename T> struct call_dtor_s {
+    T x;
+    explicit call_dtor_s(T x): x(x) {}
+    ~call_dtor_s() { x(); }
+    call_dtor_s& operator=(call_dtor_s&&) = delete;
+    call_dtor_s(call_dtor_s const &) = delete;
+    call_dtor_s& operator=(call_dtor_s const &) = delete;
+
+    // move works
+    call_dtor_s(call_dtor_s&&) noexcept = default;
+};
+template<typename T> call_dtor_s<T> call_dtor(T x) { return call_dtor_s<T>(x); }
+
+/* miscellaneous stuff for C++ */
+
+/* This is handy for range-based for loops that also need a counter.
+ */
+template<typename T>
+struct increment_counter_on_dtor {
+    T & a;
+    explicit increment_counter_on_dtor(T & a) : a(a) {}
+    ~increment_counter_on_dtor() { ++a; }
+    increment_counter_on_dtor(increment_counter_on_dtor&&) = delete;
+    increment_counter_on_dtor& operator=(increment_counter_on_dtor&&) = delete;
+    increment_counter_on_dtor(increment_counter_on_dtor const &) = delete;
+    increment_counter_on_dtor& operator=(increment_counter_on_dtor const &) = delete;
+};
+
+/* usage example:
+ *
+    size_t counter = 0;
+    for(auto x : foo) {
+        increment_counter_on_dtor<size_t> _dummy(counter);
+        if (x % 2 == 0) continue;
+        std::cout << "[" << counter << "]: " << x << "\n";
+    }
+
+ * of course, &x-begin(foo) is also acceptable, but that works only for
+ * random-access iterators.
+ */
+
+
+/* A class that can be used to instrument functions to count events.
+
+The final counts are printed at dtor time; if the counter object is static,
+it gets printed at program exit.
+Example:
+
+void foo(int x) {
+  static StaticHistogram calls(1, "Nr of times foo() was called");
+  static StaticHistogram hist(100, "Histogram of values foo() was called with", true);
+  calls.inc();
+  if (0 <= x && x < 100) hist.inc(x);
+  [... rest of foo() ...]
+}
+*/
+
+class StaticHistogram {
+    std::string name;
+    const size_t len;
+    bool print_indices;
+    std::unique_ptr<unsigned long[]> c;
+public:
+    explicit StaticHistogram(const size_t _len, const char *_name = nullptr, const bool _print_indices = false)
+        : name(_name)
+        , len(_len)
+        , print_indices(_print_indices)
+        , c(new unsigned long[_len])
+    {
+        for (size_t i = 0; i < len; i++)
+            c[i] = 0;
+    }
+    ~StaticHistogram() {
+        if (!name.empty())
+            printf("%s: ", name.c_str());
+        if (print_indices) {
+            for (size_t i = 0; i < len; i++)
+                if (c[i] > 0)
+                    printf("%s%zu:%lu", (i > 0) ? " " : "", i, c[i]);
+        } else {
+            for (size_t i = 0; i < len; i++)
+                printf("%s%lu", (i > 0) ? " " : "", c[i]);
+        }
+        printf("\n");
+    }
+    void inc(const size_t i = 0) {
+        ASSERT_ALWAYS(i < len);
+        c[i]++;
+    }
+    StaticHistogram(StaticHistogram const &) = delete;
+    StaticHistogram& operator=(StaticHistogram const &) = delete;
+    StaticHistogram& operator=(StaticHistogram&&) = delete;
+
+    // move is ok.
+    StaticHistogram(StaticHistogram&&) = default;
+};
+
+struct convert_bool {
+    template<typename T>
+    bool operator()(T const & x) const { return bool(x); }
+};
+
+/* Use this for unique_ptr's of objects allocated with malloc() */
+template<typename T>
+struct free_delete
+{
+    void operator()(T* x) {
+        free(x);        // NOLINT(cppcoreguidelines-no-malloc,hicpp-no-malloc)
+    }
+};
+
+/* This makes it possible to replace FILE* by std::unique_ptr<FILE>
+ * almost transparently. (note that we can't do that with
+ * fclose_maybe_compressed, unfortunately, since it requires to keep
+ * track of the file name. For that, see delete_FILE_maybe_compressed in
+ * gzip.h).
+ * However it is probably preferrable to define the deleter explicitly
+ * with the std::unique_ptr<FILE, delete_FILE> form, which does not rely
+ * on presence/absence of the utils_cxx.hpp header which tampers with the
+ * std namespace.
+ */
+template<>
+struct std::default_delete<FILE>
+{
+    void operator()(FILE* x) { fclose(x); }
+};
+
+using delete_FILE = std::default_delete<FILE>;
+
+// these macros are not very useful. The added benefit to having all the
+// stuff expanded is minor, or even nonexistent.
+// NOLINTBEGIN(bugprone-macro-parentheses)
+#define CADO_DEFAULT_CXX_CTOR(T)        \
+    T() = default
+
+#define CADO_DEFAULT_COPY_CTOR(T)       \
+    T(T const &) = default
+
+#define CADO_DEFAULT_COPY_ASSIGNMENT(T) \
+    T& operator=(T const &) = default
+
+#define CADO_DEFAULT_MOVE_CTOR(T)       \
+    T(T&&) = default
+
+#define CADO_DEFAULT_MOVE_ASSIGNMENT(T) \
+    T& operator=(T&&) = default
+
+#define CADO_DEFAULT_ALL_FIVE(T)        \
+    CADO_DEFAULT_CXX_CTOR(T);           \
+    CADO_DEFAULT_COPY_CTOR(T);          \
+    CADO_DEFAULT_COPY_ASSIGNMENT(T);    \
+    CADO_DEFAULT_MOVE_CTOR(T);          \
+    CADO_DEFAULT_MOVE_ASSIGNMENT(T)
+
+#define CADO_DELETE_COPY_CTOR(T)       \
+    T(T const &) = delete
+
+#define CADO_DELETE_COPY_ASSIGNMENT(T) \
+    T& operator=(T const &) = delete
+
+#define CADO_DELETE_MOVE_CTOR(T)       \
+    T(T&&) = delete
+
+#define CADO_DELETE_MOVE_ASSIGNMENT(T) \
+    T& operator=(T&&) = delete
+
+#define CADO_DELETE_ALL_FOUR(T)         \
+    CADO_DELETE_COPY_CTOR(T);           \
+    CADO_DELETE_COPY_ASSIGNMENT(T);     \
+    CADO_DELETE_MOVE_CTOR(T);           \
+    CADO_DELETE_MOVE_ASSIGNMENT(T)
+
+// NOLINTEND(bugprone-macro-parentheses)
+
+
+static inline std::vector<std::string> split(
+        const std::string& s,
+        const std::string& delimiter)
+{
+    std::vector<std::string> tokens;
+    size_t pos = 0, next;
+    for ( ;
+            (next = s.find(delimiter, pos)) != std::string::npos ;
+            pos = next + delimiter.size()
+            )
+        tokens.push_back(s.substr(pos, next - pos));
+    tokens.push_back(s.substr(pos));
+
+    return tokens;
+}
+
+template<typename Iterable>
+static inline std::string join(Iterable first, Iterable last,
+        const std::string& delimiter)
+{
+    std::string ret;
+    for(Iterable x = first ; x != last ; ++x) {
+        if (x != first) ret += delimiter;
+        ret += fmt::format("{}", *x);
+    }
+    return ret;
+}
+
+template<typename Lambda, typename Iterable>
+static inline std::string join(Iterable first, Iterable last,
+        const std::string& delimiter,
+        Lambda lambda)
+{
+    std::string ret;
+    for(Iterable x = first ; x != last ; ++x) {
+        if (x != first) ret += delimiter;
+        ret += lambda(*x);
+    }
+    return ret;
+}
+
+template<typename ItemType>
+static inline std::string join(std::vector<ItemType> const & items,
+        const std::string& delimiter)
+{
+    return join(items.begin(), items.end(), delimiter);
+}
+
+/* not sure it's really needed. after all, we might want to have a
+ * generic map construction
+ */
+template<typename Lambda, typename ItemType>
+static inline std::string join(std::vector<ItemType> const & items,
+        const std::string& delimiter,
+        Lambda lambda)
+{
+    return join(items.begin(), items.end(), delimiter, lambda);
+}
+
+template<typename ItemType, size_t N>
+static inline std::string join(std::array<ItemType, N> const & items,
+        const std::string& delimiter)
+{
+    return join(items.begin(), items.end(), delimiter);
+}
+
+/* not sure it's really needed. after all, we might want to have a
+ * generic map construction
+ */
+template<typename Lambda, typename ItemType, size_t N>
+static inline std::string join(std::array<ItemType, N> const & items,
+        const std::string& delimiter,
+        Lambda lambda)
+{
+    return join(items.begin(), items.end(), delimiter, lambda);
+}
+
+namespace strip_details {
+    struct isspace {
+        bool operator()(char c) const {
+            return std::isspace(c);
+        }
+    };
+}
+
+template<typename T>
+inline std::string& lstrip(std::string &s, T f)
+{
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [f](int ch) {
+        return !f(ch);
+    }));
+    return s;
+}
+
+template<typename T>
+inline std::string & rstrip(std::string &s, T f)
+{
+    s.erase(std::find_if(s.rbegin(), s.rend(), [f](int ch) {
+        return !f(ch);
+    }).base(), s.end());
+    return s;
+}
+
+template<typename T>
+inline std::string & strip(std::string & s, T f)
+{
+    return lstrip(rstrip(s, f), f);
+}
+
+template<typename T>
+inline std::string lstrip(std::string const & s, T f)
+{
+    std::string t = s;
+    return lstrip(t, f);
+}
+
+template<typename T>
+inline std::string rstrip(std::string const & s, T f)
+{
+    std::string t = s;
+    return rstrip(t, f);
+}
+
+template<typename T>
+inline std::string strip(std::string const & s, T f)
+{
+    std::string t = s;
+    return strip(t, f);
+}
+
+inline std::string& lstrip(std::string & s) {
+    return lstrip(s, strip_details::isspace());
+}
+inline std::string& rstrip(std::string & s) {
+    return rstrip(s, strip_details::isspace());
+}
+inline std::string& strip(std::string & s) {
+    return strip(s, strip_details::isspace());
+}
+inline std::string lstrip(std::string const & s) {
+    return lstrip(s, strip_details::isspace());
+}
+inline std::string rstrip(std::string const & s) {
+    return rstrip(s, strip_details::isspace());
+}
+inline std::string strip(std::string const & s) {
+    return strip(s, strip_details::isspace());
+}
+
+
+/* use this as: input_stream >> read_container(container, maximum_size)
+ * or possibly: input_stream >> read_container(container)
+ */
+template<typename Container>
+struct read_container_impl {
+    Container & c;
+    typename Container::size_type N;
+};
+template<typename Container>
+read_container_impl<Container>
+read_container(Container & c,
+    typename Container::size_type N = std::numeric_limits<typename Container::size_type>::max())
+{
+    return read_container_impl<Container> { c, N };
+}
+
+template<typename Container>
+std::istream& operator>>(std::istream& is, read_container_impl<Container>&& R)
+{
+    R.c.clear();
+    for(typename Container::size_type i = 0 ; is && i < R.N ; ++i) {
+        typename Container::value_type v;
+        if (is >> v)
+            R.c.emplace_back(std::move(v));
+    }
+    return is;
+}
+
+template<typename T>
+void checked_realloc(T * & var, size_t N)
+{
+    if (!(N)) {
+        free(var);
+        (var) = nullptr;
+    } else {
+        auto * p = static_cast<T *>(realloc((var), (N) * sizeof(T)));
+        if (!p && (var) != nullptr)
+            free((var));
+        ASSERT_ALWAYS(p != nullptr);
+        (var) = p;
+    }
+}
+
+static inline std::unique_ptr<FILE, delete_FILE> fopen_helper(std::string const & filename, const char * mode, bool accept_failure = false)
+{
+    std::unique_ptr<FILE, delete_FILE> f(fopen(filename.c_str(), mode));
+    DIE_ERRNO_DIAG(!f && !accept_failure, "fopen(%s)", filename.c_str());
+    return f;
+}
+
+struct decomposed_path : public std::vector<std::string> {
+    decomposed_path() : decomposed_path("/") {}
+    explicit decomposed_path(std::string const &);
+    explicit decomposed_path(const char * s) : decomposed_path(std::string(s)) {}
+    explicit operator std::string() const;
+    std::string dirname() const;
+    std::string basename() const { return back(); }
+    bool is_relative() const;
+    bool is_absolute() const { return !is_relative(); }
+    std::string extension() const;
+};
+
+namespace cado::details {
+    template<typename T, typename ... Args>
+    struct double_ratio_impl {
+        double operator()(T const & t, Args&&...);
+    };
+    template<typename T>
+    struct double_ratio_impl<T> {
+        double operator()(T const & t) { return t; }
+    };
+    template<typename T, typename U, typename ... Args>
+    struct double_ratio_impl<T, U, Args...> {
+        double operator()(T const & t, U const & u, Args&&... args) {
+            return !u ? 0 : double_ratio_impl<double, Args...>()(static_cast<double>(t) / static_cast<double>(u), std::forward<Args>(args)...);
+        }
+    };
+} /* namespace cado::details */
+
+template<typename T, typename ... Args>
+double double_ratio(T const & t, Args&&... args)
+{
+    return cado::details::double_ratio_impl<T, Args...>()(t, std::forward<Args>(args)...);
+}
+
+template<int N>
+struct expect_s
+{
+    const char * s;
+    explicit expect_s(const char s0[N]) : s(s0) {}
+};
+
+template<int N>
+static expect_s<N> expect(char const (&s0)[N]) { return expect_s<N> { s0 }; }
+
+template<int N>
+static std::istream& operator>>(std::istream& is, expect_s<N> const & e)
+{
+    char t[N];
+    is.get(t, N);  // side-
+    if (strcmp(t, e.s) != 0)
+        is.setstate(std::ios::failbit);
+    return is;
+}
+
+struct expect_string {
+    std::string s;
+};
+
+static inline expect_string expect(std::string const & s) { return { s }; }
+
+
+static inline std::istream& operator>>(std::istream & is, expect_string const & e)
+{
+    if(!std::equal(std::begin(e.s), std::end(e.s), std::istreambuf_iterator<char>{is})) {
+        is.setstate(is.rdstate() | std::ios::failbit);
+    }
+    return is;
+}
+
+namespace cado {
+    /* example:
+     *
+        foo_type compute_foo() const;
+        cado::cached_property<foo_type> cached_foo;
+        foo_type const & foo() const {
+            return cached_foo([this](){compute_foo();});
+        }
+     */
+
+    template<typename T> struct cached_property {
+        mutable std::unique_ptr<T> c;
+        template<typename F>
+        T const & operator()(F f) const
+        {
+            /* TODO: locking.
+             */
+            if (!c)
+                c = std::make_unique<T>(f());
+            return *c;
+        }
+        bool is_cached() const { return c.get(); }
+        cached_property() = default;
+        ~cached_property() = default;
+        /* make these copyable - movable. The cache is not retained when
+         * we copy, but it is kept when we move.
+         */
+        cached_property(cached_property const&) {}
+        cached_property& operator=(cached_property const& o) {
+            if (this != &o)
+                c.reset();
+            return *this;
+        }
+        cached_property(cached_property &&) noexcept = default;
+        cached_property& operator=(cached_property && o) noexcept = default;
+    };
+} /* namespace cado */
+
+namespace cado {
+    /* A type trait that checks whether an integral type T can be cast
+     * losslessly to an integral type U.
+     *
+     * In particular, both T and U must be integral types, must have the
+     * same signedness, and the maximal permissible value of type T must
+     * be no greater than that of U. (We assume value ranges of signed
+     * types to be essentially symmetric around 0).
+     */
+
+    /* Note: the full check
+     * "both integral + same sign + compatible maxval" cannot be
+     * evaluated lazily, so we need an ugly workaround.
+     */
+
+    template <typename T, typename U, bool =
+        std::is_integral_v<T> && // E: Template argument for template t…
+        std::is_integral_v<U> && 
+        std::is_signed_v<T> == std::is_signed_v<U>>
+        struct integral_fits_aux {
+            static constexpr bool value = std::numeric_limits<T>::max() <= std::numeric_limits<U>::max();
+        };
+    template <typename T, typename U>
+        struct integral_fits_aux<T, U, false> : public std::false_type {};
+    template <typename T, typename U>
+        inline constexpr bool integral_fits_v = integral_fits_aux<T, U>::value;
+
+    /* This is an alternative implementation which uses a different
+     * mechanism.
+     */
+    namespace is_narrowing_conversion_detail
+    {
+        template<typename From, typename To, typename = void>
+            struct is_narrowing_conversion_impl : std::true_type {};
+        template<typename From, typename To, typename = void>
+            struct is_non_narrowing_conversion_impl : std::false_type {};
+
+        template<typename From, typename To>
+            struct is_narrowing_conversion_impl<From, To, std::void_t<decltype(To{std::declval<From>()})>> : std::false_type {};
+        template<typename From, typename To>
+            struct is_non_narrowing_conversion_impl<From, To, std::void_t<decltype(To{std::declval<From>()})>> : std::true_type {};
+    }  /* namespace is_narrowing_conversion_detail */
+
+    template<typename From, typename To>
+        struct is_narrowing_conversion : is_narrowing_conversion_detail::is_narrowing_conversion_impl<From, To> {};
+    template<typename From, typename To>
+        struct is_non_narrowing_conversion : is_narrowing_conversion_detail::is_non_narrowing_conversion_impl<From, To> {};
+
+    template<typename From, typename To>
+    inline constexpr bool is_narrowing_conversion_v = is_narrowing_conversion<From, To>::value;
+    template<typename From, typename To>
+    inline constexpr bool is_non_narrowing_conversion_v = is_non_narrowing_conversion<From, To>::value;
+
+    /* this trait can be used in ctors and assignment operators, for
+     * instance */
+    template<typename T, typename U>
+    static constexpr bool converts_via =
+        integral_fits_v<T, U> &&
+        is_non_narrowing_conversion_v<T, U>;
+
+    /* a counting forward view, which provides a counting forward
+     * iterator, is just the replication of a given set of arguments to
+     * be provided to each dereference of the iterator, prefixed by a
+     * counter (the iterator can be dereferenced exactly n times until it
+     * is equal to its end marker).
+     *
+     * In essence, it _should_ be basically the same as the following
+     * (where ArgumentTypes... and args... are of course expository only.
+     *
+
+    auto r = std::views::iota(0U, size) | std::views::transform(
+            [&](auto i) {
+                return std::tuple<int, ArgumentTypes...>
+                    { i, args... };
+            });
+     
+     * we would like the code above to work. Unfortunately it can't work
+     * until c++23 because of the forward iterator requirements issue,
+     * which isn't fixed in c++20. See the following links:
+     *  - table 75 in §22.2.3.3 as well as forward iterator reqs §23.3.5.4
+     *  - https://wg21.link/p2408
+     *  - https://wg21.link/p2259
+     *  - https://stackoverflow.com/a/67606757
+     *
+     * as of c++20, this all boils down to the following failing:
+     *
+    static_assert(std::is_reference_v<std::iter_reference_t<decltype(r.begin())>>);
+     * basically for now we have to rely on a poor man's equivalent */
+
+    template <typename counter_type,
+             typename... Args>
+                 requires std::is_integral_v<counter_type>
+     struct counting_forward_iterator {
+        using iterator_category = std::forward_iterator_tag;
+        using value_type = std::tuple<counter_type, Args...>;
+        using difference_type = ptrdiff_t;
+        using pointer = value_type *;
+        using reference = value_type &;
+        std::tuple<counter_type, Args...> ir;
+        counter_type n;
+        template<size_t... S>
+        explicit counting_forward_iterator(counter_type n0, counter_type n1,
+                std::index_sequence<S...>,
+                std::tuple<Args...> const & a)
+            : ir { n0, std::get<S>(a)... }
+            , n(n1)
+        {}
+        explicit counting_forward_iterator(counter_type n0, counter_type n1, std::tuple<Args...> const & a)
+            : counting_forward_iterator(n0, n1,
+                std::make_index_sequence<sizeof...(Args)>(), a)
+        {
+        }
+        explicit counting_forward_iterator(counter_type n0, counter_type n1, Args&& ...args)
+            : ir { n0, args... }
+            , n(n1)
+        {
+        }
+        value_type & operator*() { return ir; }
+        value_type const & operator*() const { return ir; }
+        counting_forward_iterator<counter_type, Args...> & operator++()
+        {
+            std::get<0>(ir)++;
+            return *this;
+        }
+        bool operator==(counting_forward_iterator<counter_type, Args...> const & o) const { return (n - std::get<0>(ir)) == (o.n - std::get<0>(o.ir)); }
+    };
+    template <typename counter_type, typename... Args>
+        requires std::is_integral_v<counter_type>
+        struct counting_forward_view {
+        std::tuple<Args...> a;
+        counter_type n0;
+        counter_type n1;
+        explicit counting_forward_view(counter_type n0, counter_type n1, Args&& ...args)
+            : a { args... }
+            , n0(n0)
+            , n1(n1)
+        {}
+        counting_forward_iterator<counter_type, Args...> begin() {
+            return counting_forward_iterator<counter_type, Args...>(n0, n1, a);
+        }
+        counting_forward_iterator<counter_type, Args...> end() {
+            return counting_forward_iterator<counter_type, Args...>(n1, n1, a);
+        }
+    };
+
+    template<typename AllocatorType>
+        struct unique_ptr_from_allocator_impl {
+            using type =
+    std::unique_ptr<typename AllocatorType::value_type[],
+        std::function<void(typename AllocatorType::value_type *)>>;
+        };
+    template<typename T>
+        struct unique_ptr_from_allocator_impl<std::allocator<T>> {
+            using type = std::unique_ptr<T[]>;
+        };
+
+    template<typename AllocatorType>
+        using unique_ptr_from_allocator =
+        unique_ptr_from_allocator_impl<AllocatorType>::type;
+
+    /* This is only half-thought. We're providing something that has no
+     * equivalent in the standard library, which is to initialize all
+     * array elements with the provided args.
+     *
+     * If that's really what we want to do, then the override for
+     * std::allocator is a bad idea: the make_unique_from_allocator below
+     * would be called (if we have non trivial args) but the deleter
+     * function would be rather ill-placed (I think)
+     */
+    template<typename AllocatorType, typename... Args>
+    static inline unique_ptr_from_allocator<AllocatorType>
+    make_unique_from_allocator(AllocatorType & alloc, std::size_t size, Args... args) {
+
+        using T = AllocatorType::value_type;
+        using A = std::allocator_traits<AllocatorType>;
+
+        T *ptr = A::allocate(alloc, size);
+
+        for (std::size_t i = 0; i < size; ++i)
+            A::construct(alloc, &ptr[i], std::forward<Args>(args)...);
+
+        auto deleter = [](T * p, AllocatorType & alloc, std::size_t size) {
+            for (std::size_t i = 0; i < size; ++i)
+                A::destroy(alloc, &p[i]);
+            A::deallocate(alloc, p, size);
+        };
+
+        return { ptr, std::bind(deleter, std::placeholders::_1, alloc, size) };
+    }
+
+    template<typename T>
+    static inline std::unique_ptr<T[]>
+    make_unique_from_allocator(std::allocator<T> &, std::size_t size)
+    {
+        return std::make_unique<T[]>(size);
+    }
+
+    template <size_t N>
+    struct string_literal {
+        constexpr string_literal(string_literal<N> const & str) {
+            std::copy_n(str.value, N, value);
+        }
+        // yes, a silent conversion is what we want here. The actual
+        // "string_literal" type is not intended to be used outside
+        // library code.
+        // NOLINTNEXTLINE(google-explicit-constructor,hicpp-explicit-conversions)
+        constexpr string_literal(const char (&str)[N]) {
+            std::copy_n(str, N, value);
+        }
+
+        static_assert(N);
+        static constexpr size_t length = N - 1;
+        static constexpr bool empty() { return length == 0; }
+        char value[N] {};
+        const char * begin() const { return value; }
+        const char * end() const { return value + length; }
+    };
+
+    struct error : public std::runtime_error {
+        template<typename... Args>
+        explicit error(fmt::format_string<Args...> const & f, Args&& ...args)
+            : std::runtime_error(fmt::format(f, std::forward<Args>(args)...))
+        {}
+        explicit error(std::string const & s)
+            : std::runtime_error(s)
+        {}
+    };
+
+    /* formattable types are those that have a format_to template member,
+     * which then allows us to use define specializations of the
+     * fmt::formatter<T> struct */
+    template<typename T>
+    concept formattable = requires { T().format_to(static_cast<char *>(nullptr)); };
+} /* namespace cado */
+
+namespace fmt {
+    template<cado::formattable B>
+    struct formatter<B>
+        : public formatter<string_view>
+    {
+        auto format(B const & x, format_context& ctx) const
+        {
+            return x.format_to(ctx.out());
+        }
+    };
+} /* namespace fmt */
+
+namespace fmt {
+template <auto N>
+struct formatter<cado::string_literal<N>> : formatter<string_view>
+{
+    public:
+    auto format(cado::string_literal<N>const & x, format_context& ctx) const
+        -> decltype(ctx.out())
+    {
+        return formatter<string_view>::format(x.value, ctx);
+    }
+};
+
+} /* namespace fmt */
+
+
+#endif	/* CADO_UTILS_CXX_HPP */

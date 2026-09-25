@@ -1,0 +1,41 @@
+name = c250
+
+tasks.polyselect.degree = 6
+tasks.polyselect.P = 10000000
+tasks.polyselect.admax = 1e8
+tasks.polyselect.adrange = 5e3
+tasks.polyselect.incr = 60
+tasks.polyselect.nq = 1296 # this is 6^4
+tasks.polyselect.nrkeep = 200
+tasks.wutimeout = 24000 # required for rootsieve in degree 6
+
+tasks.lim0 = 2147483648
+tasks.lim1 = 2147483648
+tasks.lpb0 = 36
+tasks.lpb1 = 37
+tasks.sieve.mfb0 = 72
+tasks.sieve.mfb1 = 111
+tasks.sieve.ncurves0 = 50
+tasks.sieve.ncurves1 = 35
+tasks.A = 33
+tasks.sieve.sqside = 1
+
+tasks.qmin = 900000000
+
+tasks.sieve.fill_bands = 2
+
+tasks.sieve.host_mr = 1
+
+tasks.sieve.qrange = 100000
+tasks.sieve.wutimeout = 8400
+tasks.sieve.maxtimedout = 1000000
+tasks.sieve.maxfailed = 1000000
+
+tasks.filter.purge.keep = 160
+tasks.filter.target_density = 200.0
+
+tasks.linalg.bwc.interleaving = 0
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+
+tasks.linalg.characters.nchar = 50

@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Linear algebra launcher for cadofactor: runs bwc.pl of the MPI build
+# with the GPU programs in place of the bwc.pl of the pipeline build.
+#
+#   tasks.linalg.bwc.execpath=<this directory> tasks.linalg.bwc.execbin=bwc-gpu
+#
+# cadofactor passes the bwc.pl arguments (matrix, wdir, m, n, ...). The
+# launcher drops the thread grid and the checkpoint interval it builds
+# from the parameter file and appends the GPU configuration:
+#
+#   BWC_LA_BUILD   the MPI build tree of cado-nfs (build.sh: $CADO_LA_BUILD)
+#   BWC_MPI        the process grid, one rank per node (default 1x1)
+#   BWC_HOSTS      the hosts of the grid, comma separated (default: this host)
+#   BWC_MPI_EXTRA  extra mpirun arguments (transport, -x NAME exports)
+#   BWC_INTERVAL   the checkpoint interval (default 1024)
+#   BWC_EXTRA      verbatim bwc.pl arguments appended last
+#   SPMV_GF2_NGPU  the devices of one rank (default: the GPUs of this host)
+#
+# Every rank runs the matrix products on its SPMV_GF2_NGPU devices
+# (mm_impl=cuda), the device-resident krylov, mksol and lingen programs
+# (gkrylov, gmksol, glingen), and with more than one rank the NCCL
+# exchange plugin (comm_impl=nccl).
+set -Eeuo pipefail
+la_build=${BWC_LA_BUILD:?BWC_LA_BUILD is required: the MPI build tree of cado-nfs}
+mpi=${BWC_MPI:-1x1}
+hosts=${BWC_HOSTS:-$(hostname)}
+interval=${BWC_INTERVAL:-1024}
+ngpu=${SPMV_GF2_NGPU:-$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)}
+export SPMV_GF2_NGPU=$ngpu
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$(nproc)}
+
+args=()
+for a in "$@"; do
+  case "$a" in
+    thr=*|interval=*) ;;
+    *) args+=("$a") ;;
+  esac
+done
+args+=(mpi="$mpi" thr=1x1 hosts="$hosts" interval="$interval"
+       mm_impl=cuda krylov_prog=gkrylov mksol_prog=gmksol lingen_prog=glingen
+       lingen_thr=8x8)
+ranks=$(( ${mpi%x*} * ${mpi#*x} ))
+if (( ranks > 1 )); then
+  args+=(comm_impl=nccl "mpi_extra_args=-x SPMV_GF2_NGPU -x OMP_NUM_THREADS${BWC_MPI_EXTRA:+ $BWC_MPI_EXTRA}")
+fi
+if [ -n "${BWC_EXTRA:-}" ]; then
+  # shellcheck disable=SC2206
+  args+=($BWC_EXTRA)
+fi
+exec perl "$la_build/linalg/bwc/bwc.pl" "${args[@]}"

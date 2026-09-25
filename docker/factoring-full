@@ -1,0 +1,6 @@
+# syntax=docker/dockerfile:1
+FROM runtime
+LABEL org.opencontainers.image.authors="Emmanuel Thomé"
+COPY --from=build /usr/local/factoring-server/ /usr/local/
+COPY --from=build /usr/local/factoring-client/ /usr/local/
+RUN rm -rf /var/lib/apt/lists /var/cache/*

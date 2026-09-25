@@ -1,0 +1,46 @@
+name = c240
+
+tasks.polyselect.degree = 6
+
+tasks.polyselect.P = 20000000
+tasks.polyselect.admax = 2e12
+tasks.polyselect.adrange = 10000000
+tasks.polyselect.incr = 110880
+tasks.polyselect.nq = 1296 # this is 6^4
+tasks.polyselect.nrkeep = 100
+tasks.wutimeout = 7200
+tasks.polyselect.sopteffort = 20
+tasks.polyselect.ropteffort = 10
+tasks.polyselect.threads = 1
+
+tasks.lim0 = 1800000000
+tasks.lim1 = 2100000000
+tasks.lpb0 = 36
+tasks.lpb1 = 37
+tasks.sieve.mfb0 = 72
+tasks.sieve.mfb1 = 111
+tasks.sieve.lambda0 = 2.0
+tasks.sieve.lambda1 = 3.0
+tasks.sieve.ncurves0 = 100
+tasks.sieve.ncurves1 = 35
+tasks.A = 32
+tasks.sieve.sqside = 1
+
+tasks.qmin = 800000000
+
+tasks.sieve.fill_bands = 2
+
+tasks.sieve.host_mr = 1
+
+tasks.sieve.qrange = 100000
+tasks.sieve.wutimeout = 7200
+tasks.sieve.maxtimedout = 24000
+
+tasks.filter.purge.keep = 160
+tasks.filter.target_density = 200.0
+
+tasks.linalg.bwc.interleaving = 0
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+
+tasks.linalg.characters.nchar = 50

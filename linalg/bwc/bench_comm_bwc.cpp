@@ -1,0 +1,80 @@
+#include "cado.h" // IWYU pragma: keep
+
+#include <cstdio>
+#include <cstdlib>
+#include <memory>
+
+#include "parallelizing_info.hpp"
+#include "matmul_top.hpp"
+#include "select_mpi.h"
+#include "params.hpp"
+#include "bw-common.hpp"
+#include "arith-generic.hpp"
+#include "macros.h"
+
+static void * bench_comm_prog(parallelizing_info & pi, cxx_param_list & pl, void * arg MAYBE_UNUSED)
+{
+    bool fake = pl.has("random_matrix") || pl.has("static_random_matrix");
+    if (fake) bw->skip_online_checks = 1;
+    int const tcan_print = bw->can_print && pi.m.trank == 0;
+
+    int const ys[2] = { bw->ys[0], bw->ys[1], };
+    if (pi.interleaved) {
+        fprintf(stderr, "bench_bwc does not work in the interleaved setting\n");
+        exit(EXIT_FAILURE);
+    }
+
+    std::unique_ptr<arith_generic> const A(arith_generic::instance(bw->p, ys[1]-ys[0]));
+
+    matmul_top_data mmt(A.get(), pi, pl, bw->dir);
+
+    pi.m.serialize(__FILE__, __LINE__);
+    matmul_top_comm_bench(mmt, bw->dir);
+
+    if (tcan_print) {
+        printf("Done bench.\n");
+    }
+    pi.m.serialize(__FILE__, __LINE__);
+
+    return nullptr;
+}
+
+// coverity[root_function]
+int main(int argc, char const * argv[])
+{
+    cxx_param_list pl;
+
+    bw_common_init(bw, &argc, &argv);
+    parallelizing_info::init_attribute_things();
+
+    bw_common_decl_usage(pl);
+    parallelizing_info::declare_usage(pl);
+    matmul_top_decl_usage(pl);
+    /* declare local parameters and switches: none here (so far). */
+
+    bw_common_parse_cmdline(bw, pl, &argc, &argv);
+
+    bw_common_interpret_parameters(bw, pl);
+    parallelizing_info::lookup_parameters(pl);
+    matmul_top_lookup_parameters(pl);
+    /* interpret our parameters */
+    if (bw->ys[0] < 0) { fprintf(stderr, "no ys value set\n"); exit(1); }
+
+    ASSERT_ALWAYS(pl.has("ys"));
+    ASSERT_ALWAYS(!pl.has("solutions"));
+
+    if (pl.warn_unused()) {
+        int rank;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        if (!rank) pl.print_usage(stderr);
+        MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+    }
+
+    pi_go(bench_comm_prog, pl, nullptr);
+
+    parallelizing_info::clear_attribute_things();
+    bw_common_clear(bw);
+
+    return 0;
+}
+

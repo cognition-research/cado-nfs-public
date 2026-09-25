@@ -1,0 +1,114 @@
+###########################################################################
+#     Parameter file for Cado-NFS
+###########################################################################
+# See parameters/factor/params.c90 for an example which contains some
+# documentation.
+# See parameters/factor/params.qs.c90 for an example which contains some
+# documentation specific to the QS algorithm for factorization.
+#
+# Undocumented parameters have the same meaning as in NFS.
+
+###########################################################################
+# General parameters
+###########################################################################
+
+name = d90
+
+###########################################################################
+# Sieve
+###########################################################################
+
+tasks.I = 14
+tasks.lim0 = 400000
+tasks.lpb0 = 23
+tasks.sieve.mfb0 = 46
+
+# Special-q's are different in QS: they are integers q that are products of
+# n primes taken from an given interval. The number of prime factors is set
+# by tasks.sieve.qfac_min, the bounds of the interval are set by
+# tasks.sieve.qfac_min (inclusive) and tasks.sieve.qfac_max (exclusive).
+#
+# The combinatorial number system is used to assign an index to every
+# possible special-q (for more details, see [0]). So tasks.qmin is the
+# **index** of the smallest special-q considered and tasks.qrange is the
+# **number** of special-q considered for each sieving task.
+# [0] https://en.wikipedia.org/wiki/Combinatorial_number_system
+#
+# The smallest norms are obtain when the size of the special-q is
+# sqrt(|discriminant|)/((2^I)/2).
+
+# Number of prime factors of the special-q
+tasks.sieve.qfac_nfac = 12
+
+# Lower bound on primes appearing in the special-q
+tasks.sieve.qfac_min = 2400
+
+# upper bound on primes appearing in the special-q
+tasks.sieve.qfac_max = 2900
+
+# Number of special-q's per elementary sieving task
+tasks.sieve.qrange = 250
+
+# There is no real reason to have tasks.qmin != 0.
+# tasks.qmin = 0
+
+tasks.sieve.ncurves0 = 12
+
+tasks.sieve.rels_wanted = 300000
+
+# tasks.filter.purge.col_min_index = 10000
+
+###########################################################################
+# Filtering
+###########################################################################
+
+tasks.filter.target_density = 170.0
+
+# The filtering step will generate tasks.nmatrices square matrices for the
+# linear algebra step. The gcd of the determinants of these matrices gives
+# a multiple of the class number. The more matrices is used, the closer to
+# the class number the gcd is. But in practice, having two matrices is
+# enough.
+tasks.nmatrices = 2
+
+###########################################################################
+# Linalg
+###########################################################################
+
+# Default value is 1 (same as NFS-DL)
+# tasks.linalg.n = 1
+
+# Default value is 2*n (same as NFS-DL)
+# tasks.linalg.m = 2
+
+# The linear algebra step computes determinants of square matrices over Z
+# using CRT by looping over primes. The loop is stopped when the
+# reconstructed value stay the same after tasks.linalg.stop_after_neq
+# iterations. Default value is 2.
+# tasks.linalg.stop_after_neq = 2
+
+# Size (in bits) of the moduli used by linear algebra.
+# Default value is 64
+tasks.linalg.moduli_nbits = 256
+
+###########################################################################
+# Computing the group structure
+###########################################################################
+
+# Two new binaries are used for class groups computation: factor and
+# cl_structure_from_group_order. They both accept a verbose parameter.
+# Default value is false.
+# tasks.groupstructure.factor.verbose = false.
+# tasks.groupstructure.cl_structure_from_group_order.verbose = false
+
+# Given a factored multiple of the group order, use all prime ideals with
+# norm below this bound to look for generators.
+# Default is 6*log(|discriminant|)^2 (Bach bound, assumes GRH).
+# tasks.groupstructure.cl_structure_from_group_order.generators_bound = 10000
+
+# Use naive p-Sylow computation if the p-part of the group order is below
+# or equal to this bound. The program will abort if it exists a p such that
+# the p-part of the group order is larger than this bound. In practice, the
+# naive algorithm is only used for computing 2-Sylow and 3-Sylow.
+# Default value is 65536 (>= 2^16 and 3^10).
+# tasks.groupstructure.cl_structure_from_group_order.pSylow_bound = 65536

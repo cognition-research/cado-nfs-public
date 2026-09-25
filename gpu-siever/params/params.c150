@@ -1,0 +1,41 @@
+name = c150
+
+tasks.polyselect.degree = 5
+
+tasks.polyselect.P = 290000
+tasks.polyselect.admin = 2160
+tasks.polyselect.admax = 14e4
+tasks.polyselect.adrange = 1260
+tasks.polyselect.incr = 420
+tasks.polyselect.nq = 156250
+tasks.polyselect.nrkeep = 72
+tasks.polyselect.sopteffort = 3
+tasks.polyselect.ropteffort = 25
+
+tasks.lim0 = 28000000
+tasks.lim1 = 36000000
+tasks.lpb0 = 31
+tasks.lpb1 = 31
+tasks.sieve.mfb0 = 59
+tasks.sieve.mfb1 = 60
+tasks.sieve.lambda0 = 1.91
+tasks.sieve.lambda1 = 1.94
+tasks.sieve.ncurves0 = 14
+tasks.sieve.ncurves1 = 15
+tasks.I = 14
+tasks.qmin = 3000000
+tasks.sieve.rels_wanted = 163000000
+tasks.sieve.qrange = 300000
+tasks.sieve.wutimeout = 4800
+tasks.sieve.maxtimedout = 6000
+
+tasks.filter.purge.keep = 180
+tasks.filter.required_excess = 0.08
+tasks.filter.target_density = 140.0
+
+tasks.linalg.bwc.interval = 4000
+tasks.linalg.bwc.interleaving = 0
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+
+tasks.linalg.characters.nchar = 50

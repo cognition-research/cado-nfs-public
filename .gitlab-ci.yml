@@ -1,0 +1,679 @@
+# see also ci/ci/debug.sh
+
+stages:
+  - build
+  - early
+  - thorough
+  - publish
+
+image: gcc
+
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive
+
+
+clean-pipelines:
+  # run this only in the master branch, since the GITLAB_ACCESS_TOKEN is
+  # (now) protected, and cannot be used by pipelines from other branches.
+  stage: publish
+  allow_failure: true
+  variables:
+    GITLAB_URL: https://gitlab.inria.fr/
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH == "master" && $CI_SERVER_HOST == "gitlab.inria.fr"
+      when: always
+    - when: never
+  image: registry.gitlab.inria.fr/sdt-pfo/tools/gitlab-quotas-helper-component/poetry-python:1.7.1-3.12
+  script:
+    - cmd=("gitlab-api connect project $CI_PROJECT_ID pipelines --days 365")
+    - cmd+=" delete --force"
+    - eval $cmd
+
+# include:
+#   - component: $CI_SERVER_FQDN/sdt-pfo/tools/gitlab-quotas-helper-component/clean-pipelines@1.0.1
+#     inputs:
+#       days: 365
+#       dry_run: false
+#       stage: publish
+#     rules:
+#     - if: $CI_COMMIT_BRANCH && ($CI_COMMIT_BRANCH == "master")
+# 
+# artifacts are a subset of pipelines..
+# - component: $CI_SERVER_FQDN/sdt-pfo/tools/gitlab-quotas-helper-component/clean-artifacts@1.0.1 
+#   inputs:
+#     days: 365
+#     dry_run: false
+#     stage: publish
+
+# took inspiration from https://blog.callr.tech/building-docker-images-with-gitlab-ci-best-practices/
+# however I'm not sure if/how the "latest" tagging actually works.
+
+# Note that the name of each section is significant, as the file
+# ci/ci/001-environment.sh sets some important environment variables based
+# on what it finds. E.g. it reacts to "with gcc", "expensive checks",
+# "coverage tests", and so on.
+
+# We're using a few features from gitlab yaml:
+#
+# - [yaml anchors](https://docs.gitlab.com/ce/ci/yaml/#anchors)
+# - manual disable of pipeline elements, which we do more or less by hand
+#   (finer grained than the ["skip ci"
+#   syntax](https://docs.gitlab.com/ee/ci/yaml/#skip-pipeline))
+#
+
+  
+############################################################################
+# This template is used so that if the magic words "skip some ci" are
+# found in the git commit, then the whole pipeline becomes manual.
+.common-template: &common-template
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /skip some ci/
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_MESSAGE =~ /only coverage/
+      when: never
+    - when: on_success
+  retry:
+    max: 2
+    when: runner_system_failure
+  
+.coverage-template: &coverage-template
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /skip some ci/
+      when: manual
+      allow_failure: false
+    - when: on_success
+  retry:
+    max: 2
+    when: runner_system_failure
+  
+# see also https://gitlab.com/gitlab-org/gitlab/-/issues/201845 regarding
+# the pipeline deduplication
+workflow:
+   rules:
+     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+       when: never
+     - when: always
+   # https://gitlab.com/gitlab-org/gitlab/-/issues/23605
+   auto_cancel:
+     on_job_failure: all
+
+############################################################################
+# The jobs that do checks.
+#
+# Basically, much of the work is done in shell scripts for convenience,
+# and they're grouped in the template below.
+
+.checks-script: &checks-script
+  - ci/ci/40-testsuite.sh
+
+.checks-junit-report: &checks-junit-report
+  artifacts:
+    reports:
+      junit: junit.xml
+
+checks with gcc:
+  <<: *common-template
+  stage: early
+  image: gcc:latest
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks on alpine system with gcc:
+  <<: *common-template
+  stage: early
+  image: alpine:latest
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks on debian system with 32-bit gcc:
+  <<: *common-template
+  stage: early
+  image: debian
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks on ubuntu system with gcc:
+  <<: *common-template
+  stage: early
+  image: ubuntu:latest
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks on ubuntu jammy system using package libfmt-dev with gcc:
+  <<: *common-template
+  stage: early
+  image: ubuntu:jammy
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks on ubuntu rolling system with gcc:
+  <<: *common-template
+  stage: early
+  image: ubuntu:rolling
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks on debian-testing system with 32-bit gcc:
+  <<: *common-template
+  stage: early
+  image: debian:testing
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks using cmake directly on alpine system with gcc:
+  <<: *common-template
+  stage: early
+  image: alpine
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks using cmake directly with shared libs on alpine system with gcc:
+  <<: *common-template
+  stage: early
+  image: alpine
+  variables:
+    pass_flags_to_cmake: -DBUILD_SHARED_LIBS=ON
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks on debian system with gcc:
+  <<: *common-template
+  stage: early
+  image: debian:latest
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks on debian-testing system with gcc:
+  <<: *common-template
+  stage: early
+  image: debian:testing
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks shared libs on debian-testing system with gcc:
+  <<: *common-template
+  stage: early
+  image: debian:testing
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks on debian11 system with gcc:
+  <<: *common-template
+  stage: early
+  image: debian:11
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+# this fails more often than not, lately because of their repo
+# idiosyncrasies. Maybe it's transient, maybe it's just me, but at this
+# point I've had enough.
+# checks on opensuse system with gcc:
+#   <<: *common-template
+#   stage: early
+#   image: opensuse/tumbleweed
+#   before_script:
+#     - ci/ci/00-prepare-docker.sh
+#   script:
+#     - *checks-script
+#   <<: *checks-junit-report
+ 
+checks on fedora system with gcc:
+  <<: *common-template
+  stage: early
+  image: fedora:latest
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+# checks on centos system with gcc:
+#   <<: *common-template
+#   stage: early
+#   image: quay.io/centos/centos:stream
+#   before_script:
+#     - ci/ci/00-prepare-docker.sh
+#   script:
+#     - *checks-script
+#   <<: *checks-junit-report
+ 
+checks on centos9 system with gcc:
+  allow_failure: true
+  <<: *common-template
+  stage: early
+  image: quay.io/centos/centos:stream9
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+# Despite what the description on docker hub says, silkeh/clang:latest is
+# not always the latest stable build, which is a pity.
+checks with clang:
+  <<: *common-template
+  image: silkeh/clang:latest
+  stage: early
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks with clangdev:
+  <<: *common-template
+  image: silkeh/clang:dev
+  stage: early
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks with icc:
+  <<: *common-template
+  image: intel/oneapi-hpckit:latest
+  stage: early
+  tags:
+    - icc
+    - mpi
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+including_mpi specific checks with openmpi:
+  <<: *common-template
+  image: alpine:latest
+  stage: early
+  tags:
+    - mpi
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+expensive checks with gcc:
+  <<: *common-template
+  stage: thorough
+  needs: []
+  image: gcc:latest
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+mysql specific expensive checks on debian-testing system with gcc:
+  <<: *common-template
+  image: debian:testing
+  stage: thorough
+  # this is #30114
+  allow_failure: true
+  needs: []
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+mysql specific expensive checks on debian12 system with gcc:
+  <<: *common-template
+  image: debian:testing
+  stage: thorough
+  # this is #30114
+  allow_failure: true
+  needs: []
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+checks under valgrind on debian-testing system on a debug build with gcc:
+  tags:
+    - valgrind
+  rules:
+    # valgrind checking takes many hours. It's simply not feasible for it to be
+    # part of the normal implement-MR-test-investigate-debug cycle.
+    - if: $CI_COMMIT_MESSAGE =~ /skip some ci/
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_BRANCH && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "valgrind")
+      when: always
+    - if: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME == "valgrind"
+      when: always
+    - when: never
+  retry:
+    max: 2
+    when: runner_system_failure
+  stage: publish
+  image: debian:testing
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+  artifacts:
+    # https://gitlab.com/gitlab-org/gitlab-foss/-/issues/4034#note_17683608
+    when: always
+    paths:
+      - valgrind.*.tar.gz
+
+bwc.sagemath specific expensive checks with gcc:
+  <<: *common-template
+  stage: thorough
+  needs: [ "checks with gcc" ]
+  image:
+    name: sagemath/sagemath:latest
+    entrypoint: [ "" ]
+  before_script:
+    - sudo -E ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+
+############################################################################
+# coverage. Actually, this is not really dependent on checks, after all.
+# It does depend on the availability of the coverage images, though!
+.coverage-job: &coverage-job
+  <<: *coverage-template
+  stage: thorough
+  needs: []
+  image: alpine:latest
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+  artifacts:
+    paths:
+      - coverage-*.json
+      - coverage-*.info
+      - coverage-*-generated-sources.tar.gz
+    expire_in: 1 week
+
+coverage tests 1/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 2/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 3/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 4/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 5/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 6/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 7/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 8/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 9/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 10/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 11/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 12/13 on checks with gcc:
+  <<: *coverage-job
+coverage tests 13/13 on checks with gcc:
+  <<: *coverage-job
+
+
+
+# The json coverage reports for different runs are imported, provided we
+# get the needs/artifacts combination right.
+#
+# https://stackoverflow.com/questions/38140996/how-can-i-pass-artifacts-to-another-stage
+# https://docs.gitlab.com/ee/ci/yaml/#artifact-downloads-with-needs
+#
+# Once this job has run, the job artifacts, and in particular the html
+# rendering of the coverage report, can be downloaded using links that
+# are formed according to the following rules:
+#
+# https://docs.gitlab.com/ee/ci/pipelines/job_artifacts.html#downloading-the-latest-artifacts
+#
+# Actually it took me a while to figure out the correct url. For the
+# master branch, we want: https://gitlab.inria.fr/cado-nfs/cado-nfs/-/jobs/artifacts/master/file/coverage/index.html?job=merge+coverage+tests
+#
+# The good thing is that we don't need to play dirty tricks with gitlab
+# pages and subdirectories. As it turns out, the final rendered page does
+# show up under cado-nfs.gitlabpages.inria.fr, but we do not need to care
+# about it.
+merge coverage tests:
+  <<: *coverage-template
+  stage: publish
+  # remove the "needs" keyword, as this causes the whole "publish" stage
+  # to run early on, including when earlier stages actually failed!
+  # needs:
+  #   - job: coverage tests on checks with gcc
+  #     artifacts: true
+  #   # list more of these...
+  # This image has gcovr installed
+  image: alpine:latest
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+    - ci/ci/09-merge-coverage.sh
+  artifacts:
+    paths:
+      - coverage
+      - coverage.tar.gz
+    expire_in: 30 days
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+  coverage: '/lines:\s\d+\.\d+\%/'
+
+
+############################################################################
+# Tests on slow machines and/or shell executors. They depend on nothing.
+
+# # It would be possible to run the following test on arm64 as well, but my
+# # only runner is an allwinner CPU with 2G of RAM, and it takes more than
+# # two hours :-(. I think I would have to reduce the test surface first.
+# #    - arm64
+# #
+# # # very slow machines run with the shell executor anyway.
+# # # 00-prepare-shell.sh can only check if software is present.
+# run on very slow machines:
+#   <<: *common-template
+#   stage: thorough
+#   tags:
+#     - raspberry
+#   before_script:
+#     - ci/ci/00-prepare-shell.sh
+#   script:
+#     - *checks-script
+#   <<: *checks-junit-report
+ 
+# in fact, this one should be quick !
+checks on osx system:
+  <<: *common-template
+  # do it early. It's one of our quickest runners.
+  stage: early
+  tags:
+    - osx
+  before_script:
+    - ci/ci/00-prepare-shell.sh
+  script:
+    - *checks-script
+  <<: *checks-junit-report
+ 
+checks on freebsd14.4 system with clang:
+  <<: *common-template
+  stage: thorough
+  tags:
+    - freebsd-14.4
+  needs: []
+  before_script:
+    - sudo -E ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+
+checks on freebsd15.0 system with clang:
+  <<: *common-template
+  stage: thorough
+  tags:
+    - freebsd-15.0
+  needs: []
+  before_script:
+    - sudo -E ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+
+checks on freebsd15.1 system with clang:
+  <<: *common-template
+  stage: thorough
+  tags:
+    - freebsd-15.1
+  needs: []
+  before_script:
+    - sudo -E ci/ci/00-prepare-docker.sh
+  script:
+    - *checks-script
+
+# 20260205: coverity scan is down (or dead?) https://scan.coverity.com/
+coverity on debian11 system with gcc:
+  # override the common template.
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /skip some ci/
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_MESSAGE =~ /only coverage/
+      when: never
+    - if: $CI_COMMIT_BRANCH && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "coverity")
+      when: always
+    - when: never
+  stage: early
+  image: debian:11
+  before_script:
+    - ci/ci/00-prepare-docker.sh
+  script:
+  - curl -o /tmp/cov-analysis-linux64.tgz
+    https://scan.coverity.com/download/linux64
+    --form project=$COVERITY_SCAN_PROJECT_NAME
+    --form token=$COVERITY_SCAN_TOKEN
+  - tar xfz /tmp/cov-analysis-linux64.tgz
+  - ci/ci/01-conf.sh
+  - cov-analysis-linux64-*/bin/cov-build --dir cov-int ci/ci/02-build.sh
+  - tar cfz cov-int.tar.gz cov-int
+  - curl https://scan.coverity.com/builds?project=$COVERITY_SCAN_PROJECT_NAME
+    --form token=$COVERITY_SCAN_TOKEN
+    --form email=$COVERITY_SCAN_USER_EMAIL
+    --form file=@cov-int.tar.gz
+    --form version="`git describe --tags`"
+    --form description="`git describe --tags` / $CI_COMMIT_TITLE / $CI_COMMIT_REF_NAME:$CI_PIPELINE_ID"
+ 
+containers:
+  stage: publish
+  tags:
+    - docker
+  image: docker
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /skip some ci/
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_MESSAGE =~ /only coverage/
+      when: never
+    - if: $CI_COMMIT_BRANCH && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "containers")
+      when: on_success
+    - if: $CI_COMMIT_REF_NAME && $CI_COMMIT_REF_NAME == "containers"
+      when: on_success
+    - when: never
+  script:
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - apk update
+    - apk add make bash git
+    - make -f docker/Makefile PUSH=yes NOW=$(date +%Y%m%d%H%M-$CI_COMMIT_SHA)
+  retry:
+    max: 2
+    when: runner_system_failure
+
+test-containers:
+  stage: publish
+  needs: [ "containers" ]
+  tags:
+    - docker
+  image: registry.gitlab.inria.fr/cado-nfs/cado-nfs/factoring-full
+  rules:
+    - if: $CI_COMMIT_MESSAGE =~ /skip some ci/
+      when: manual
+      allow_failure: false
+    - if: $CI_COMMIT_MESSAGE =~ /only coverage/
+      when: never
+    - if: $CI_COMMIT_BRANCH && ($CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "containers")
+      when: on_success
+    - if: $CI_COMMIT_REF_NAME && $CI_COMMIT_REF_NAME == "containers"
+      when: on_success
+    - when: never
+  script:
+    - cado-nfs.py 90377629292003121684002147101760858109247336549001090677693
+  retry:
+    max: 2
+    when: runner_system_failure
+
+
+# same, but do not restrict to the master branch
+dry-run containers:
+  stage: early
+  tags:
+    - docker
+  image: docker
+  <<: *common-template
+  script:
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - apk update
+    - apk add make bash git
+    - make -f docker/Makefile NOW=$(date +%Y%m%d%H%M-$CI_COMMIT_SHA)
+
+
+
+# "cache" is only when the runners have a notion of available cache
+# server, it seems. Don't do that for now.
+# cache:
+# # paths:
+# - "*.o"

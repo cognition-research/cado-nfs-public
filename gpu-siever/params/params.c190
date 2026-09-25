@@ -1,0 +1,35 @@
+name = c190
+
+tasks.polyselect.degree = 5
+
+tasks.polyselect.P = 5000000
+tasks.polyselect.admax = 5e6
+tasks.polyselect.adrange = 1000
+tasks.polyselect.incr = 60
+tasks.polyselect.nq = 3125
+tasks.polyselect.nrkeep = 200
+
+tasks.lim0 = 340600000
+tasks.lim1 = 162343750
+tasks.lpb0 = 31
+tasks.lpb1 = 32
+tasks.sieve.mfb0 = 62
+tasks.sieve.mfb1 = 93
+tasks.sieve.ncurves0 = 13
+tasks.sieve.ncurves1 = 14
+tasks.I = 16
+tasks.qmin = 101875000
+tasks.sieve.bkmult = 1.1
+
+tasks.sieve.qrange = 45000
+tasks.sieve.wutimeout = 4800
+tasks.sieve.maxtimedout = 6000
+
+tasks.filter.purge.keep = 160
+tasks.filter.target_density = 150.0
+
+tasks.linalg.bwc.interleaving = 0
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+
+tasks.linalg.characters.nchar = 50

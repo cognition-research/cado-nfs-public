@@ -1,0 +1,60 @@
+###########################################################################
+#     Parameter file for Cado-NFS
+###########################################################################
+# See parameters/factor/params.c90 for an example which contains some
+# documentation.
+# See parameters/cl/params.qs.d90 for an example which contains some
+# documentation specific to the QS algorithm for class groups.
+#
+# Undocumented parameters have the same meaning as in NFS or QS for class
+# groups.
+
+###########################################################################
+# General parameters
+###########################################################################
+
+name = c90
+
+###########################################################################
+# Sieve
+###########################################################################
+
+tasks.I = 14
+tasks.lim0 = 400000
+tasks.lpb0 = 23
+tasks.sieve.mfb0 = 46
+
+tasks.sieve.qfac_nfac = 12
+tasks.sieve.qfac_min = 2400
+tasks.sieve.qfac_max = 2900
+tasks.sieve.qrange = 250
+
+tasks.sieve.ncurves0 = 12
+
+# A stragegy to find a good value of rels_wanted for a given size is the
+# following. First use tasks.sieve.rels_wanted=1, and look in cxxx.log
+# for the final value of rels_wanted.
+tasks.sieve.rels_wanted = 155000
+
+###########################################################################
+# Filtering
+###########################################################################
+
+tasks.filter.purge.keep = 128
+tasks.filter.target_density = 170.0
+
+###########################################################################
+# Linalg
+###########################################################################
+
+tasks.linalg.bwc.interleaving = 0
+tasks.linalg.m = 64
+tasks.linalg.n = 64
+
+###########################################################################
+# Characters
+###########################################################################
+
+# In the case of QS for factorization, the number of characters must be 1.
+# The only needed character corresponds to the sign of the relation.
+tasks.linalg.characters.nchar = 1
