@@ -9,6 +9,8 @@ CADO_BUILD ?= $(CURDIR)/build/cado-sieve
 CXX ?= g++
 NVCC ?= nvcc
 CUDA_ARCH ?= 90
+# log2 of the sieve region; 14 fits the 64 KB of shared memory of sm_75
+SREG_LOG ?= 15
 CXXFLAGS ?= -O3 -std=c++20 -march=native -g -Wall -Wextra
 NVCCFLAGS ?= -O3 -std=c++17 -arch=sm_$(CUDA_ARCH) --extended-lambda
 INCLUDES = -I$(CADO_SRC) -I$(CADO_SRC)/utils -I$(CADO_SRC)/utils/embedded \
@@ -34,7 +36,7 @@ eprime: src/eprime_main.cpp $(EPRIME_SRC) src/eprime.hpp
 	    $(LIBS)
 
 sieve_core_gpu.o: src/sieve_core_gpu.cu src/sieve_core.hpp
-	$(NVCC) $(NVCCFLAGS) -c -o $@ src/sieve_core_gpu.cu
+	$(NVCC) $(NVCCFLAGS) -DGLAS_SREG_LOG=$(SREG_LOG) -c -o $@ src/sieve_core_gpu.cu
 
 glas-gpu: $(SRC) sieve_core_gpu.o src/sieve_core.hpp src/cofac_strategy.hpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $(SRC) sieve_core_gpu.o \

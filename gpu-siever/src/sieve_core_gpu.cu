@@ -56,7 +56,10 @@ namespace {
 
 constexpr int MAX_SLOTS = 8;                  /* special-q in flight */
 constexpr uint32_t FCAND_MAX = 1u << 15;      /* assembled candidates per chunk */
-constexpr int SREG_LOG = 15;                  /* positions per region */
+#ifndef GLAS_SREG_LOG
+#define GLAS_SREG_LOG 15
+#endif
+constexpr int SREG_LOG = GLAS_SREG_LOG;       /* positions per region */
 constexpr uint32_t SREG = 1u << SREG_LOG;
 constexpr uint32_t SKIP_ROOT = UINT32_MAX;
 
@@ -1277,7 +1280,15 @@ fill_row_kernel(gpu_task t, gpu_fb_entry const * fb, uint32_t n_small,
     uint32_t off = ((uint64_t)r * jb + I / 2) % q;
     if constexpr (ROWS) {
         static_assert(FILL_THREADS * ROWS < (1u << (32 - 17)));
+#if __CUDA_ARCH__ >= 900
         auto const cluster = cooperative_groups::this_cluster();
+#else
+        /* No thread-block clusters below compute capability 9.0; C is 1 there. */
+        struct {
+            __device__ void sync() const {}
+            __device__ uint32_t * map_shared_rank(uint32_t * p, uint32_t) const { return p; }
+        } const cluster;
+#endif
         auto sync = [&] {
             if constexpr (C == 1) __syncthreads();
             else cluster.sync();
@@ -1693,7 +1704,7 @@ region_kernel(gpu_task t, gpu_small_entry const * small,
      * the span, so that span is evaluated exactly.  Lane l stores its 4
      * positions as one 8-byte word, so a warp store covers 32 consecutive
      * words: no bank conflicts. */
-    constexpr uint32_t WP = SREG / 32;     /* positions per warp */
+    constexpr uint32_t WP = 1024;          /* positions per warp */
     constexpr uint32_t NS = WP / 128;      /* spans per lane */
     static_assert(WP <= 1u << 12, "a warp run stays inside one row: logI >= 12");
     uint32_t const lane = threadIdx.x & 31;
@@ -1931,7 +1942,7 @@ region_kernel(gpu_task t, gpu_small_entry const * small,
      * conflicts) and a ballot forms the word.  One extra slack unit covers
      * the fast-log rounding differences against the CPU core.  Row 0 has
      * no survivors, and an even row none at even i, where gcd(i, j) > 1. */
-    static_assert(SREG / 32 == 1024, "one mask word per thread");
+    static_assert(SREG / 32 <= 1024, "one mask word per thread");
     uint32_t const limit =
         BIAS + (uint32_t)(t.bound[side] + SURVIVOR_SLACK + 1);
     uint32_t const row_mask = j == 0 ? 0 : j & 1 ? ~0u : 0xaaaaaaaau;
@@ -4052,7 +4063,7 @@ static void launch_region(gpu_task const & t, gpu_slot const & s,
                           uint64_t * const * buckets,
                           uint32_t * const * bucket_cnt, int par, int side)
 {
-    region_kernel<CAND><<<t.nregions, 1024, REGION_SMEM, s.stream>>>(
+    region_kernel<CAND><<<t.nregions, SREG / 32, REGION_SMEM, s.stream>>>(
         t, ctx.small[side], ctx.n_small[side], ctx.n_dense[side],
         ctx.n_skip[side], ctx.n_pat[side],
         s.roots[side], ctx.bucket_cap[side],

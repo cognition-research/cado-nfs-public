@@ -65,6 +65,14 @@ The individual targets are in the `Makefile`; `make glas` builds a
 CPU-only siever and `make matmul-cpu-stub` a CPU implementation of
 the matmul backend, both for validation on a machine without a GPU.
 
+`glas-gpu` alone also builds for older cards. `SREG_LOG` is the log2 of
+the sieve region (default 15); the default region needs 75.6 KB of
+shared memory per block and a T4 allows 64 KB, so it needs 14:
+
+    make glas-gpu CUDA_ARCH=89               # L4, L40S
+    make glas-gpu CUDA_ARCH=86               # A10
+    make glas-gpu CUDA_ARCH=75 SREG_LOG=14   # T4
+
 ## Running a factorization
 
 The pipeline is the stock `cado-nfs.py` of the pipeline build. Three
